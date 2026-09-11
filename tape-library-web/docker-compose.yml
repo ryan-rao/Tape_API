@@ -1,0 +1,15 @@
+services:
+  tape-api:
+    image: tape-library-api:1.0
+    # 生产环境替换为真实 API 主机部署；此处示例以本机 8001 端口运行
+    network_mode: host
+    restart: unless-stopped
+
+  tape-web:
+    build: .
+    image: tape-library-web:1.0
+    container_name: tape-library-web
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+    # 真实模式前端通过 nginx 反代 /api/ 到 tape-api

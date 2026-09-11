@@ -1,0 +1,12 @@
+import { chromium } from '@playwright/test';
+const b = await chromium.launch();
+const page = await b.newPage({ viewport: { width: 1600, height: 900 } });
+page.on('pageerror', (e) => console.log('PAGEERROR:', e.message.slice(0, 200)));
+const t0 = Date.now();
+await page.goto('http://172.16.12.186:8080/', { waitUntil: 'commit' });
+await page.getByText('Tape Libraries').first().waitFor({ timeout: 60000 });
+console.log('首屏可见:', Date.now() - t0, 'ms');
+await page.getByText('API Logs').first().waitFor({ timeout: 5000 });
+console.log('菜单含 API Logs ✓');
+await page.screenshot({ path: 'screenshots/verify-split.png' });
+await b.close();

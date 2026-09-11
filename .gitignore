@@ -1,0 +1,24 @@
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+# deploy leftovers
+tape-library-api/app/tmp_deploy/
+tape-library-api/app/services/*.bak-*
+tape-library-api/app/services/services.py.bak*
+tape-library-api/*.bak*
+# build artifacts
+tape-library-web/dist/
+tape-library-web/node_modules/
+tape-library-web/screenshots/
+tape-library-web/playwright-report/
+tape-library-web/test-results/
+# archives & misc
+*.tar.gz
+api_code/
+cli_test/
+tape-library-api/test-results/
+tape-library-api/manual-evidence3-sections.md
+nohup.out
+tape-library-api/audit/
+tape-library-api/manual-evidence*/

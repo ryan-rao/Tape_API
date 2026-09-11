@@ -1,0 +1,449 @@
+# -*- coding: utf-8 -*-
+"""Parsers: structure raw CLI stdout into JSON objects.
+
+Design: keep raw `stdout` in API responses for audit traceability, and add a
+`parsed` object with structured fields. Parsers are regex/line based and must
+never raise: on unparseable output they return {"parse_error": ...} or partial
+results with a "parsed_ok" flag.
+"""
+import re
+
+__all__ = ["parse_sg_scan", "parse_sg_map", "parse_sg_inq",
+           "parse_mt_status", "parse_mtx_status", "parse_mt_compression",
+           "parse_sg_vpd", "parse_sg_modes", "parse_sg_logs", "parse_tur",
+           "parse_dd_summary", "parse_dmesg_lines", "parse_lsmod",
+           "parse_tapealert", "parse_os_release", "parse_uname",
+           "parse_id", "auto_parse"]
+
+
+def parse_sg_scan(stdout):
+    """sg_scan output:
+    /dev/sg0: scsi33 channel=0 id=0 lun=0
+    """
+    devices = []
+    for line in stdout.splitlines():
+        m = re.match(r"(/dev/sg\d+):\s+scsi(\d+)\s+channel=(\d+)\s+id=(\d+)\s+lun=(\d+)", line.strip())
+        if m:
+            devices.append({
+                "sg_device": m.group(1),
+                "scsi_host": int(m.group(2)),
+                "channel": int(m.group(3)),
+                "id": int(m.group(4)),
+                "lun": int(m.group(5)),
+            })
+    return {"devices": devices, "parsed_ok": bool(devices)}
+
+
+def parse_sg_map(stdout):
+    """sg_map -i output:
+    /dev/sg0 /dev/nst0 IBM ULT3580-TDA T3S0
+    /dev/sg1 IBM 03584L32 2C02
+    """
+    mapping = []
+    for line in stdout.splitlines():
+        if not line.strip() or not line.strip().startswith("/dev/"):
+            continue
+        parts = line.strip().split()
+        entry = {"sg_device": parts[0], "nst_device": None,
+                 "vendor": None, "product": None, "revision": None}
+        rest = parts[1:]
+        if rest and rest[0].startswith("/dev/n"):
+            entry["nst_device"] = rest[0]
+            rest = rest[1:]
+        if len(rest) >= 2:
+            entry["vendor"] = rest[0]
+            entry["product"] = rest[1]
+        if len(rest) >= 3:
+            entry["revision"] = rest[2]
+        mapping.append(entry)
+    return {"mapping": mapping, "parsed_ok": bool(mapping)}
+
+
+def parse_sg_inq(stdout):
+    """sg_inq output lines:
+      vendor identification: IBM
+      product identification: ULT3580-TDA
+      product revision level: T3S0
+      device type: tape
+    """
+    fields = {}
+    for line in stdout.splitlines():
+        m = re.match(r"\s*([a-zA-Z0-9 _]+?):\s*(.+)$", line)
+        if m:
+            key = m.group(1).strip().lower().replace(" ", "_")
+            fields[key] = m.group(2).strip()
+    # normalize alternate key spellings (mtx inquiry / sg_inq variants)
+    alias = {
+        "vendor_id": "vendor_identification",
+        "vendor": "vendor_identification",
+        "product_id": "product_identification",
+        "product": "product_identification",
+        "revision": "product_revision_level",
+        "product_revision": "product_revision_level",
+        "product_type": "device_type",
+        "attached_changer_api": None,  # keep as extra info below
+    }
+    norm = {}
+    for k, v in fields.items():
+        v = v.strip().strip(chr(39)).strip(chr(34)).strip()  # strip quotes/padding
+        target = alias.get(k, k)
+        if target:
+            norm[target] = v
+        else:
+            norm[k] = v
+    wanted = ["vendor_identification", "product_identification",
+              "product_revision_level", "device_type", "unit_serial_number",
+              "attached_changer_api"]
+    parsed = {k: norm[k] for k in wanted if k in norm}
+    parsed["parsed_ok"] = bool(
+        parsed.get("vendor_identification") or parsed.get("product_identification"))
+    return parsed
+
+
+def parse_mt_status(stdout):
+    """mt status output example:
+    SCSI 2 tape drive:
+    File number=1, block number=0, partition=0.
+    Tape block size 0 bytes. Density code 0x58 (LTO-7).
+    Soft error count since last status=0
+    General status bits on (41000000):
+     BOT ONLINE
+    """
+    parsed = {
+        "file_number": None, "block_number": None, "partition": None,
+        "block_size": None, "density_code": None, "density_name": None,
+        "soft_error_count": None, "flags": [],
+    }
+    m = re.search(r"File number=(-?\d+), block number=(-?\d+), partition=(\d+)", stdout)
+    if m:
+        parsed["file_number"], parsed["block_number"], parsed["partition"] = \
+            int(m.group(1)), int(m.group(2)), int(m.group(3))
+    m = re.search(r"Tape block size (\d+) bytes", stdout)
+    if m:
+        parsed["block_size"] = int(m.group(1))
+    m = re.search(r"Density code (0x[0-9a-fA-F]+)(?: \(([^)]+)\))?", stdout)
+    if m:
+        parsed["density_code"] = m.group(1)
+        parsed["density_name"] = m.group(2)
+    m = re.search(r"Soft error count since last status=(\d+)", stdout)
+    if m:
+        parsed["soft_error_count"] = int(m.group(1))
+    m = re.search(r"General status bits on \([0-9a-fA-F]+\):\s*\n\s*(.+)", stdout)
+    if m:
+        parsed["flags"] = m.group(1).split()
+    parsed["at_bot"] = "BOT" in parsed["flags"]
+    parsed["at_eod"] = "EOD" in parsed["flags"] or "EOT" in parsed["flags"]
+    parsed["tape_online"] = "ONLINE" in parsed["flags"] or "DR_OPEN" not in parsed["flags"]
+    parsed["parsed_ok"] = parsed["file_number"] is not None
+    return parsed
+
+
+def parse_mtx_status(stdout):
+    """mtx status output:
+    Storage Element 1:Full:VolumeTag = IBM006LA
+    Storage Element 2:Full (Storage Element 2 Import/Export):VolumeTag = ...
+      Drive 0 (Transfer) Full (Storage Element 6):VolumeTag = IBM015LA
+    """
+    slots, drives = [], []
+    for line in stdout.splitlines():
+        s = line.strip()
+        m = re.match(r"Storage Element (\d+):(Full|Empty)", s)
+        if m:
+            slot = {"element": int(m.group(1)), "occupied": m.group(2) == "Full",
+                    "import_export": "Import/Export" in s, "barcode": None}
+            tag = re.search(r"VolumeTag\s*=\s*(\S+)", s)
+            if tag:
+                slot["barcode"] = tag.group(1)
+            slots.append(slot)
+            continue
+        m = re.match(r"Drive (\d+) .*?(Full|Empty)", s) or \
+            re.match(r"Data Transfer Element (\d+):(Full|Empty)", s)
+        if m:
+            drv = {"drive": int(m.group(1)), "occupied": m.group(2) == "Full",
+                   "barcode": None, "source_slot": None}
+            tag = re.search(r"VolumeTag\s*=\s*(\S+)", s)
+            if tag:
+                drv["barcode"] = tag.group(1)
+            src = re.search(r"Storage Element (\d+)", s)
+            if src:
+                drv["source_slot"] = int(src.group(1))
+            drives.append(drv)
+    return {
+        "slots": slots, "drives": drives,
+        "occupied_slots": sum(1 for x in slots if x["occupied"]),
+        "loaded_drives": sum(1 for x in drives if x["occupied"]),
+        "parsed_ok": bool(slots or drives),
+    }
+
+
+def parse_mt_compression(stdout):
+    """mt compression output: 'Compression: on' or 'Data compression: on' etc."""
+    text = stdout.lower()
+    enabled = None
+    if "compression" in text:
+        enabled = not re.search(r"compression:\s*off", text)
+    return {"compression_enabled": enabled, "parsed_ok": enabled is not None}
+
+
+def _hex_dump_stats(stdout):
+    """Common stats for SCSI hex-dump style outputs (vpd/modes/logs)."""
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    hex_lines = sum(1 for ln in lines if re.search(r"\b[0-9a-f]{2}( [0-9a-f]{2}){7,}\b", ln))
+    return {"total_lines": len(lines), "hex_dump_lines": hex_lines,
+            "text_lines": len(lines) - hex_lines}
+
+
+def parse_sg_vpd(stdout):
+    """sg_vpd output: page header + key=value params + hex dump.
+    e.g. 'unit serial number page (0x80)' / 'Device identification page (0x83)'.
+    """
+    parsed = {"page_code": None, "page_name": None, "fields": {}, "ascii": []}
+    m = re.search(r"\(?0x([0-9a-fA-F]{2})\)?", stdout.splitlines()[0] if stdout.splitlines() else "")
+    if m:
+        parsed["page_code"] = "0x" + m.group(1).lower()
+    name = re.match(r"\s*(.+?)\s+page", stdout.splitlines()[0] if stdout.splitlines() else "", re.I)
+    if name:
+        parsed["page_name"] = name.group(1).strip()
+    for line in stdout.splitlines():
+        m = re.match(r"\s*([A-Za-z0-9 _/]+?):\s*(\S.*)$", line)
+        if m and not re.match(r"^\s*[0-9a-f]{2}( [0-9a-f]{2})+", line):
+            parsed["fields"][m.group(1).strip().lower().replace(" ", "_")] = m.group(2).strip()
+        if re.search(r"[!-~]{4,}", line) and not re.search(r"\b[0-9a-f]{2}( [0-9a-f]{2}){7,}\b", line):
+            frag = re.findall(r"[!-~]{4,}", line)
+            parsed["ascii"].extend(frag)
+    parsed.update(_hex_dump_stats(stdout))
+    parsed["parsed_ok"] = parsed["page_code"] is not None or bool(parsed["fields"])
+    return parsed
+
+
+def parse_sg_modes(stdout):
+    """sg_modes -a output: mode data header + multiple mode pages.
+    Page headers look like: 'Control mode page (0x0a)' / ' Disconnect-Reconnect mode page (0x02)'.
+    """
+    pages = []
+    for line in stdout.splitlines():
+        m = re.search(r"([A-Za-z][A-Za-z0-9 _/-]*?)\s+page\s*\(?0x([0-9a-fA-F]+)\)?", line)
+        if m:
+            pages.append({"page_name": m.group(1).strip(), "page_code": "0x" + m.group(2).lower()})
+    fields = {}
+    for line in stdout.splitlines():
+        m = re.match(r"\s*([A-Za-z0-9 _]+)=([^ ]+)", line)
+        if m:
+            fields[m.group(1).strip().lower().replace(" ", "_")] = m.group(2).strip(",")
+    parsed = {"mode_pages": pages, "header_fields": fields}
+    parsed.update(_hex_dump_stats(stdout))
+    parsed["parsed_ok"] = bool(pages) or bool(fields)
+    return parsed
+
+
+def parse_sg_logs(stdout, page=None):
+    """sg_logs [-a|-p page] output: log page headers + params + hex dumps."""
+    pages = []
+    for line in stdout.splitlines():
+        m = re.search(r"([A-Za-z][A-Za-z0-9 _/-]*?)\s+(?:log sense )?page\s*\(?0x([0-9a-fA-F]+)\)?", line)
+        if m:
+            pages.append({"page_name": m.group(1).strip(), "page_code": "0x" + m.group(2).lower()})
+    fields = {}
+    for line in stdout.splitlines():
+        m = re.match(r"\s*([A-Za-z0-9 _/]+?):\s*(\d+(?:\.\d+)?)\s*$", line)
+        if m:
+            fields[m.group(1).strip().lower().replace(" ", "_")] = float(m.group(2)) \
+                if "." in m.group(2) else int(m.group(2))
+    parsed = {"requested_page": page or "all", "log_pages": pages, "parameters": fields}
+    parsed.update(_hex_dump_stats(stdout))
+    parsed["parsed_ok"] = bool(pages) or bool(fields)
+    return parsed
+
+
+def parse_os_release(stdout):
+    """/etc/os-release: KEY=value lines."""
+    fields = {}
+    for line in stdout.splitlines():
+        m = re.match(r"([A-Z_]+)=(?:\"([^\"]*)\"|(\S*))", line)
+        if m:
+            fields[m.group(1).lower()] = m.group(2) if m.group(2) is not None else m.group(3)
+    return {"name": fields.get("name"), "version": fields.get("version"),
+            "version_id": fields.get("version_id"), "id": fields.get("id"),
+            "pretty_name": fields.get("pretty_name"), "all_fields": fields,
+            "parsed_ok": bool(fields)}
+
+
+def parse_uname(stdout):
+    """uname -a: 'Linux node186 5.14.0-570.12.1.el9_6.x86_64 #1 SMP ... x86_64 x86_64'"""
+    parts = stdout.split()
+    if len(parts) < 4:
+        return {"parsed_ok": False}
+    return {"kernel_name": parts[0], "hostname": parts[1], "kernel_release": parts[2],
+            "kernel_version": parts[3] if "#" in parts[3] else None,
+            "machine": parts[-1], "parsed_ok": True}
+
+
+def parse_id(stdout):
+    """id: 'uid=0(root) gid=0(root) groups=0(root) context=...'"""
+    parsed = {"uid": None, "user": None, "gid": None, "group": None, "groups": []}
+    m = re.search(r"uid=(\d+)\(([^)]+)\)", stdout)
+    if m:
+        parsed["uid"], parsed["user"] = int(m.group(1)), m.group(2)
+    m = re.search(r"gid=(\d+)\(([^)]+)\)", stdout)
+    if m:
+        parsed["gid"], parsed["group"] = int(m.group(1)), m.group(2)
+    m = re.search(r"groups=(.+)", stdout)
+    if m:
+        parsed["groups"] = [g.strip() for g in m.group(1).split()]
+    parsed["parsed_ok"] = parsed["uid"] is not None
+    return parsed
+
+
+def auto_parse(command, stdout="", stderr="", exit_code=0):
+    """Dispatch parser by executable name in the command string (audit endpoint)."""
+    if not command:
+        return {"parsed_ok": False, "reason": "empty command"}
+    cmd = command.split()
+    exe = cmd[0].rsplit("/", 1)[-1]
+    out = (stdout or "").strip()
+    err = (stderr or "").strip()
+    try:
+        if exe == "sg_inq":
+            return parse_sg_inq(out)
+        if exe == "sg_vpd":
+            return parse_sg_vpd(out)
+        if exe == "sg_modes":
+            return parse_sg_modes(out)
+        if exe == "sg_logs":
+            if "0x2e" in command:
+                return parse_tapealert(out)
+            page = None
+            m = re.search(r"-p (0x[0-9a-fA-F]+)", command)
+            if m:
+                page = m.group(1)
+            return parse_sg_logs(out, page)
+        if exe == "sg_turs":
+            return parse_tur(out, err, exit_code)
+        if exe == "sg_scan":
+            return parse_sg_scan(out)
+        if exe == "sg_map":
+            return parse_sg_map(out)
+        if exe == "lsscsi":
+            return {"devices": [ln.strip() for ln in out.splitlines() if ln.strip()],
+                    "parsed_ok": bool(out)}
+        if exe == "mtx":
+            if " status" in command or " inventory" in command:
+                return parse_mtx_status(out)
+            if " inquiry" in command:
+                return parse_sg_inq(out)
+            return {"subcommand": cmd[1] if len(cmd) > 1 else None,
+                    "exit_code": exit_code, "parsed_ok": True,
+                    "note": "robot action (load/unload/transfer/position): success = exit_code 0"}
+        if exe == "mt":
+            sub = cmd[2] if len(cmd) > 2 else ""
+            if sub == "status":
+                return parse_mt_status(out)
+            if sub == "compression":
+                return parse_mt_compression(out)
+            if sub == "weof":
+                return {"filemarks_written": "count arg", "parsed_ok": exit_code == 0,
+                        "note": "weof success = exit_code 0"}
+            return {"operation": sub, "parsed_ok": exit_code == 0,
+                    "note": "tape motion command: success = exit_code 0"}
+        if exe == "dd":
+            return parse_dd_summary(err or out)
+        if exe == "lsmod":
+            return parse_lsmod(out)
+        if exe in ("dmesg", "journalctl"):
+            return parse_dmesg_lines(out)
+        if exe == "cat" and "os-release" in command:
+            return parse_os_release(out)
+        if exe == "uname":
+            return parse_uname(out)
+        if exe == "id":
+            return parse_id(out)
+        if exe == "hostname":
+            return {"hostname": out, "parsed_ok": bool(out)}
+        return {"parsed_ok": False, "reason": "no dedicated parser for %s" % exe}
+    except Exception as exc:  # parsers must never break audit responses
+        return {"parsed_ok": False, "reason": "parser error: %s" % exc}
+
+
+def parse_tapealert(stdout):
+    """sg_logs -p 0x2e TapeAlert output: full flag matrix.
+    Each line: ' Read warning: 0'. Value 0 = not triggered, 1 = triggered (bool flag),
+    some counters may exceed 1. Severity per SSC spec: critical flags (hard error,
+    failures) = CRITICAL, warnings = WARNING, informational = INFO.
+    """
+    _CRITICAL = {"hard error", "read failure", "write failure",
+                 "unrecoverable mechanical cartridge failure",
+                 "memory chip in cartridge failure", "hardware a", "hardware b",
+                 "interface", "power supply failure", "firmware failure",
+                 "worm medium - integrity check failed"}
+    flags, triggered = [], []
+    device = None
+    page = None
+    for line in stdout.splitlines():
+        m = re.match(r"\s*(.+?):\s*(\d+)\s*$", line)
+        if m:
+            name, value = m.group(1).strip(), int(m.group(2))
+            severity = "CRITICAL" if name.lower() in _CRITICAL else "WARNING"
+            entry = {"name": name, "value": value, "severity": severity,
+                     "triggered": value != 0}
+            flags.append(entry)
+            if value != 0:
+                triggered.append(entry)
+            continue
+        if not device and re.match(r"\s*IBM\s+\S+", line):
+            device = line.strip()
+        if page is None and re.search(r"Tape alert page", line, re.I):
+            page = line.strip()
+    return {"device": device, "page": page,
+            "flags": flags,
+            "total_flags": len(flags),
+            "triggered_alerts": triggered,
+            "triggered_count": len(triggered),
+            "all_clear": len(triggered) == 0,
+            "parsed_ok": bool(flags)}
+
+
+def parse_tur(stdout, stderr, exit_code):
+    """sg_turs: usually empty output; ready implied by exit code."""
+    return {"ready": exit_code == 0, "stdout_text": stdout.strip(),
+            "stderr_text": stderr.strip(), "parsed_ok": True}
+
+
+def parse_dd_summary(stderr):
+    """dd stderr summary:
+    '1048576+0 records in\n1048576+0 records out\n1073741824 bytes (1.1 GB, 1.0 GiB) copied, 4.4 s, 243 MB/s'
+    """
+    parsed = {"bytes": None, "bytes_human": None, "seconds": None,
+              "throughput": None, "records_in": None, "records_out": None}
+    m = re.search(r"(\d+)\+(\d+) records in", stderr)
+    if m:
+        parsed["records_in"] = int(m.group(1)) + int(m.group(2))
+    m = re.search(r"(\d+)\+(\d+) records out", stderr)
+    if m:
+        parsed["records_out"] = int(m.group(1)) + int(m.group(2))
+    m = re.search(r"(\d+) bytes \(([^)]+)\) copied, ([\d.]+) s, ([\d.]+ [kMG]B/s)", stderr)
+    if m:
+        parsed["bytes"] = int(m.group(1))
+        parsed["bytes_human"] = m.group(2)
+        parsed["seconds"] = float(m.group(3))
+        parsed["throughput"] = m.group(4)
+    parsed["parsed_ok"] = parsed["bytes"] is not None or parsed["records_out"] is not None
+    return parsed
+
+
+def parse_dmesg_lines(stdout):
+    """dmesg/journalctl kernel log: split to line array (latest last)."""
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    tape_related = [ln for ln in lines if re.search(r"st\d|sg\d|tape|changer|lin_tape|scsi", ln, re.I)]
+    return {"total_lines": len(lines), "tape_related_lines": len(tape_related),
+            "tape_related_tail": tape_related[-20:], "parsed_ok": True}
+
+
+def parse_lsmod(stdout):
+    """lsmod: 'module size used_by' per line."""
+    modules = []
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] != "Module":
+            modules.append({"module": parts[0], "size": int(parts[1]) if parts[1].isdigit() else parts[1],
+                            "used_by": int(parts[2]) if parts[2].isdigit() else parts[2]})
+    return {"modules": modules, "parsed_ok": bool(modules)}

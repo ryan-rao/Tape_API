@@ -49,6 +49,38 @@ def validate_drive(drive: int) -> int:
     return drive
 
 
+def validate_setting(value: int, lo: int, hi: int, code: str = "INVALID_VALUE") -> int:
+    """Validate a numeric setting/count outside the drive-index range (block size,
+    density code, block number, partition count, ...)."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < lo or value > hi:
+        _bad(400, code)
+    return value
+
+
+def validate_output_path(path: str) -> str:
+    """Validate an output file path for read tests: must be an absolute path,
+    no shell metachars, no traversal, must not target /dev (device protection)."""
+    if not path or not isinstance(path, str) or not path.startswith("/"):
+        _bad(400, "INVALID_PATH", "file must be an absolute path")
+    if INJECTION_CHARS.search(path) or ".." in path:
+        _bad(400, "INVALID_PATH", "invalid file path")
+    if path.startswith("/dev/"):
+        _bad(400, "INVALID_PATH", "refusing to write into /dev")
+    return path
+
+
+def validate_input_path(path: str) -> str:
+    """Validate an input file path for write tests: absolute, no metachars/traversal,
+    must not point into /dev or /proc/sys (device/kernel protection)."""
+    if not path or not isinstance(path, str) or not path.startswith("/"):
+        _bad(400, "INVALID_PATH", "file must be an absolute path")
+    if INJECTION_CHARS.search(path) or ".." in path:
+        _bad(400, "INVALID_PATH", "invalid file path")
+    if path.startswith("/dev/") or path.startswith("/proc/") or path.startswith("/sys/"):
+        _bad(400, "INVALID_PATH", "refusing to read from /dev, /proc or /sys")
+    return path
+
+
 def require_level(risk_level: str):
     if not settings.level_allowed(risk_level):
         if risk_level == "LEVEL_2":
@@ -60,8 +92,8 @@ def require_level(risk_level: str):
 
 
 def validate_position_operation(op: str) -> str:
-    allowed = {"rewind", "fsf", "fsfm", "bsf", "bsfm", "fsr", "bsr", "fss", "bss",
-               "asf", "seek", "eom", "eod", "seod", "offline", "eject", "load", "rewoffl", "tell"}
+    allowed = {"rewind", "fsf", "fsfm", "bsf", "bsfm", "fsr", "bsr", "fss", "bss", "asf",
+               "eom", "eod", "seod", "offline"}
     if op not in allowed:
         _bad(400, "INVALID_OPERATION")
     return op

@@ -187,13 +187,6 @@ class DiscoveryService(BaseService):
             devices.append(dev)
         return {"devices": devices, "command_id": rec["command_id"]}
 
-    def sg_scan_only(self):
-        """Run only sg_scan and return raw + parsed output."""
-        from app.commands import parsers
-        scan = self.ensure_pass(self.exec(LsscsiAdapter().scan(), "DISCOVERY", "LEVEL_1"))
-        return {"sg_scan": {"stdout": scan["stdout"], "command_id": scan["command_id"],
-                            "parsed": parsers.parse_sg_scan(scan["stdout"])}}
-
     def scan_detail(self):
         """Raw sg_scan + sg_map -i results (CLI PHASE 09 equivalents)."""
         from app.commands import parsers
@@ -229,365 +222,21 @@ class DeviceService(BaseService):
         from app.commands import parsers
         rec = self.exec(self.sg.tur(sg), "TUR", "LEVEL_1", device=sg)
         ready = rec["exit_code"] == 0
-        if not ready:
-            # empty output == device ready (per sg_turs semantics); any error output
-            # means Test Unit Ready failed -> report as API failure
-            raise ServiceError("DEVICE_NOT_READY",
-                               "device %s not ready: %s" % (sg, (rec["stdout"] or rec["stderr"] or "test unit ready failed").strip().splitlines()[0]),
-                               rec)
         return {"ready": ready, "stdout": rec["stdout"], "stderr": rec["stderr"],
                 "command_id": rec["command_id"],
                 "parsed": parsers.parse_tur(rec["stdout"], rec["stderr"], rec["exit_code"])}
 
-    def modes(self, sg, page=None):
-        """Formatted MODE SENSE output: drive summary + structured mode pages.
-        page: optional hex page code (e.g. 0x0f) to query a single mode page."""
+    def modes(self, sg):
         from app.commands import parsers
-        from app.commands.adapters import LsscsiAdapter, MtAdapter
-        import re as _re
-        sg_full = sg if sg.startswith("/dev/") else "/dev/" + sg
-        rec = self.ensure_pass(self.exec(self.sg.modes(sg_full, page), "MODES", "LEVEL_1", device=sg_full))
-        parsed = parsers.parse_sg_modes(rec["stdout"])
-        if page:
-            pg = page.lower()
-            matched = [x for x in parsed.get("mode_pages", []) if x.get("page_code") == pg]
-            return {"page": pg,
-                    "mode_page": matched[0] if matched else None,
-                    "mode_pages": matched,
-                    "stdout": rec["stdout"], "command_id": rec["command_id"],
-                    "parsed": parsed}
-
-        drive = {}
-        head = rec["stdout"].splitlines()
-        if head:
-            m = _re.match(r"\s*(\S+)\s+(\S+)\s+(\S+)\s+peripheral_type:\s*(\S+)", head[0])
-            if m:
-                drive = {"vendor": m.group(1), "model": m.group(1) + " " + m.group(2),
-                         "firmware": m.group(3), "peripheral_type": m.group(4)}
-        hf = parsed.get("header_fields", {})
-        drive["density_code"] = hf.get("density_code")
-        drive["mode_data_length"] = hf.get("mode_data_length")
-
-        # enrich: serial (inquiry), ready (tur), tape position (mt status)
-        try:
-            inq = self.ensure_pass(self.exec(self.sg.inquiry(sg_full), "INQUIRY", "LEVEL_1", device=sg_full))
-            ip = parsers.parse_sg_inq(inq["stdout"])
-            drive["serial_number"] = ip.get("unit_serial_number")
-        except Exception:
-            drive["serial_number"] = None
-        try:
-            tur = self.exec(self.sg.tur(sg_full), "TUR", "LEVEL_1", device=sg_full)
-            drive["status"] = "READY" if tur["exit_code"] == 0 else "NOT READY"
-            drive["scsi"] = "ONLINE"
-        except Exception:
-            drive["status"] = drive["scsi"] = "UNKNOWN"
-        # find nst for this sg, then mt status for position/medium
-        drive.update({"medium": "UNKNOWN", "file_number": None, "block_number": None,
-                      "partition": None, "block_size": None})
-        try:
-            lrec = self.ensure_pass(self.exec(LsscsiAdapter().list_all(), "DISCOVERY", "LEVEL_1"))
-            nst = None
-            for line in lrec["stdout"].splitlines():
-                if line.rstrip().endswith(sg_full):
-                    m2 = _re.search(r"/dev/st\d+", line)
-                    if m2:
-                        nst = m2.group(0).replace("/dev/st", "/dev/nst")
-                    break
-            if nst:
-                mt = MtAdapter()
-                srec = self.ensure_pass(self.exec(mt.status(nst), "DRIVE_STATUS", "LEVEL_1", device=nst))
-                sp = parsers.parse_mt_status(srec["stdout"])
-                drive.update({"file_number": sp.get("file_number"),
-                              "block_number": sp.get("block_number"),
-                              "partition": sp.get("partition"),
-                              "block_size": sp.get("block_size"),
-                              "density_code": sp.get("density_code") or drive.get("density_code")})
-                fl = sp.get("flags") or []
-                drive["medium"] = "NOT LOADED" if "DR_OPEN" in fl else "LOADED"
-        except Exception:
-            pass
-        return {"drive": drive, "mode_pages": parsed.get("mode_pages", []),
-                "header_fields": hf, "stdout": rec["stdout"], "command_id": rec["command_id"],
-                "parsed": parsed}
+        rec = self.ensure_pass(self.exec(self.sg.modes(sg), "MODES", "LEVEL_1", device=sg))
+        return {"stdout": rec["stdout"], "command_id": rec["command_id"],
+                "parsed": parsers.parse_sg_modes(rec["stdout"])}
 
     def logs(self, sg, page=None):
         from app.commands import parsers
         rec = self.ensure_pass(self.exec(self.sg.logs(sg, page), "LOGS", "LEVEL_1", device=sg))
         return {"page": page or "all", "stdout": rec["stdout"], "command_id": rec["command_id"],
                 "parsed": parsers.parse_sg_logs(rec["stdout"], page)}
-
-    def discovery_map(self):
-        """Full device inventory: lsscsi + sg_inq + sysfs + dmesg(lpfc) + block limits."""
-        import os
-        import re as _re
-        from app.commands import parsers
-        from app.commands.adapters import LsscsiAdapter
-        lrec = self.ensure_pass(self.exec(LsscsiAdapter().list_all(), "DISCOVERY", "LEVEL_1"))
-        entries = parsers.parse_lsscsi_g_entries(lrec["stdout"])
-
-        # fc adapter info from dmesg lpfc PCI lines
-        fc_pci = {}
-        try:
-            drec = self.exec(["dmesg"], "SYSTEM_DIAG", "LEVEL_1", timeout=60)
-            for ln in drec["stdout"].splitlines():
-                m = _re.search(r"lpfc [0-9:]+\.(\d):", ln)
-                if m:
-                    fc_pci.setdefault(m.group(1), None)
-        except Exception:
-            pass
-
-        devices = []
-        for e in entries:
-            addr = e["scsi_address"]
-            host = addr.split(":")[0]
-            blkname = e["block_device"].split("/")[-1]      # st0 / ch0
-            sgname = e["sg_device"].split("/")[-1]
-            is_tape = blkname.startswith("st")
-            # sg_inq for PDT / ANSI / kernel identity
-            pdt = ansi = None
-            ident = serial = None
-            try:
-                irec = self.ensure_pass(self.exec(self.sg.inquiry(e["sg_device"]), "INQUIRY", "LEVEL_1", device=e["sg_device"]))
-                mt = _re.search(r"PDT=(\d+)", irec["stdout"])
-                mv = _re.search(r"version=0x([0-9a-f]+)", irec["stdout"])
-                mi = _re.search(r"Peripheral device type:\s*(.+)$", irec["stdout"], _re.M)
-                ms = _re.search(r"Unit serial number:\s*(\S+)", irec["stdout"])
-                if mt: pdt = int(mt.group(1))
-                if mv: ansi = int(mv.group(1), 16)
-                ident = mi.group(1).strip() if mi else None
-                serial = ms.group(1) if ms else None
-            except Exception:
-                pass
-            # sysfs driver
-            drv = None
-            try:
-                drv = os.path.basename(os.path.realpath("/sys/bus/scsi/devices/%s/driver" % addr))
-            except Exception:
-                pass
-            # PCI path via host device symlink
-            pci = None
-            try:
-                p = os.path.realpath("/sys/class/scsi_host/host%s/device" % host)
-                mpcl = _re.findall(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]", p)
-                if mpcl:
-                    pci = mpcl[-1]
-            except Exception:
-                pass
-            fc_model = None
-            if pci:
-                try:
-                    pv = open("/sys/bus/pci/devices/%s/vendor" % pci).read().strip()
-                    pd = open("/sys/bus/pci/devices/%s/device" % pci).read().strip()
-                    if (pv, pd) == ("0x10df", "0xf100"):
-                        fc_model = "Emulex LPe12000"
-                    else:
-                        fc_model = "PCI %s:%s" % (pv, pd)
-                except Exception:
-                    pass
-            # block limits for tape drives
-            blk_limits = None
-            if is_tape:
-                try:
-                    import subprocess as _sp
-                    r = _sp.run(["sg_read_block_limits", e["sg_device"]],
-                                capture_output=True, text=True, timeout=30)
-                    rout = r.stdout + r.stderr  # sg_read_block_limits prints to stderr
-                    mn = _re.search(r"Minimum block size:\s*(\d+)", rout)
-                    mx = _re.search(r"Maximum block size:\s*(\d+)", rout)
-                    if mn or mx:
-                        blk_limits = {"min_bytes": int(mn.group(1)) if mn else None,
-                                      "max_bytes": int(mx.group(1)) if mx else None}
-                except Exception:
-                    pass
-            dev = {
-                "label": None,
-                "device_type": "Tape Drive" if is_tape else "Medium Changer",
-                "vendor": e["vendor"], "model": e["model"], "firmware": e["firmware"],
-                "serial_number": serial,
-                "scsi_address": addr, "scsi_host": "host" + host,
-                "target": addr.split(":")[2], "lun": addr.split(":")[3],
-                "ansi_version": ansi, "pdt": pdt,
-                "st_device": e["block_device"] if is_tape else None,
-                "ch_device": e["block_device"] if not is_tape else None,
-                "sg_device": e["sg_device"],
-                "kernel_driver": drv, "sg_driver": "sg",
-                "kernel_identity": ident or ("Sequential-Access" if is_tape else "Medium Changer"),
-                "fc_adapter": fc_model, "fc_driver": "lpfc",
-                "pci_path": pci, "discovered": True,
-                "block_limits": blk_limits,
-                "function": "磁带读写" if is_tape else "机械手/带库控制",
-                "operations": "Read/Write/Rewind/Mode Sense/Log Sense" if is_tape else "Inventory/Move/Load/Unload",
-                "component": "Tape Drive" if is_tape else "Library Robot",
-            }
-            devices.append(dev)
-        # label: order by sg number (sg0 -> Drive 1, sg2 -> Drive 2, ...)
-        devices.sort(key=lambda d: int(d["sg_device"].split("sg")[-1]))
-        di = li = 0
-        for d in devices:
-            if d["device_type"] == "Tape Drive":
-                di += 1
-                d["label"] = "Drive %d" % di
-            else:
-                li += 1
-                d["label"] = "Library %d" % li
-        matrix = [{"sg": d["sg_device"],
-                   "block_device": d["st_device"] or d["ch_device"],
-                   "scsi_address": d["scsi_address"],
-                   "device_type": d["device_type"],
-                   "model": d["model"],
-                   "firmware": d["firmware"]} for d in devices]
-        # group by FC HBA host (tree view)
-        by_hba = {}
-        for d in devices:
-            h = by_hba.setdefault(d["scsi_host"], {
-                "fc_adapter": d["fc_adapter"], "fc_driver": d["fc_driver"],
-                "host": d["scsi_host"], "pci_path": d["pci_path"], "targets": []})
-            h["targets"].append({
-                "scsi_address": d["scsi_address"],
-                "vendor": d["vendor"], "model": d["model"],
-                "block_device": d["st_device"] or d["ch_device"],
-                "sg_device": d["sg_device"],
-                "device_type": d["device_type"]})
-        hba_tree = sorted(by_hba.values(), key=lambda x: x["host"])
-        return {"matrix": matrix, "devices": devices,
-                "hba_tree": hba_tree, "command_id": lrec["command_id"]}
-
-    def modes_summary(self, sg):
-        """Curated MODE SENSE summary: drive + block descriptor + compression
-        + partition + light-weight page list."""
-        full = self.modes(sg)
-        drive = full.get("drive", {})
-        hf = full.get("header_fields", {})
-        pages = full.get("mode_pages", [])
-
-        def page(code):
-            for x in pages:
-                if x.get("page_code") == code:
-                    return x
-            return None
-
-        comp = page("0x0f") or {}
-        part = page("0x11") or {}
-        cf = comp.get("fields", {})
-        bf = part.get("byte_fields", {})
-        return {
-            "drive": drive,
-            "block_descriptor": {
-                "density_code": hf.get("density_code"),
-                "number_of_blocks": hf.get("number_of_blocks"),
-                "block_length": hf.get("block_length"),
-            },
-            "compression": {
-                "compression_control": cf.get("compression_control"),
-                "decompression_control": cf.get("decompression_control"),
-                "compression_algorithm": cf.get("compression_algorithm"),
-                "decompression_algorithm": cf.get("decompression_algorithm"),
-                "scsi": comp.get("scsi"),
-            },
-            "partition": {
-                "partition_config": bf.get("byte_2"),
-                "partition_status": bf.get("byte_3"),
-                "scsi": part.get("scsi"),
-            },
-            "pages": [{"page_code": x.get("page_code"), "page_name": x.get("page_name"),
-                       "description": x.get("description", ""),
-                       "page_length_bytes": x.get("page_length_bytes"),
-                       "scsi": x.get("scsi")} for x in pages],
-            "command_id": full.get("command_id"),
-        }
-
-    def logs_summary(self, sg):
-        """Curated LOG SENSE summary: key health/lifetime/error/volume metrics."""
-        from app.commands import parsers
-        sg_full = sg if sg.startswith("/dev/") else "/dev/" + sg
-        rec = self.ensure_pass(self.exec(self.sg.logs(sg_full), "LOGS", "LEVEL_1", device=sg_full))
-        parsed = parsers.parse_sg_logs(rec["stdout"], None)
-        pages = {p["page_code"]: p for p in parsed.get("log_pages", [])}
-
-        def val(page_code, name, default=None):
-            pg = pages.get(page_code) or {}
-            for f in pg.get("fields", []):
-                if f["name"] == name:
-                    return f["value"]
-            return default
-
-        alerts = [f for f in (pages.get("0x2e") or {}).get("fields", [])
-                  if isinstance(f.get("value"), int) and f["value"]]
-        diags = (pages.get("0x16") or {}).get("records", [])
-        last_diag = None
-        for rec16 in diags:
-            f = {x["name"]: x["value"] for x in rec16.get("fields", [])}
-            if f.get("Sense key") and not str(f.get("Sense key", "")).startswith("0x0 "):
-                last_diag = {
-                    "parameter_code": rec16.get("parameter_code"),
-                    "sense_key": f.get("Sense key"),
-                    "additional_sense": f.get("Additional sense"),
-                    "medium_type": f.get("Medium type"),
-                    "medium_id": f.get("Volume reference") or f.get("Medium ID"),
-                    "repeat": f.get("Repeat"),
-                }
-            else:
-                break
-        # partition capacities from 0x17 counters
-        def part_counters(prefix_hint):
-            out = {}
-            pg = pages.get("0x17") or {}
-            names = [f["name"] for f in pg.get("fields", [])]
-            # counters appear in order; skip (keys not tracked), fall back to None
-            return out
-        summary = {
-            "device": parsed.get("device", {}),
-            "health": parsed.get("health_summary", []),
-            "tape_alert_active": len(alerts),
-            "tape_alert_flags": [f["name"] for f in alerts] if alerts else [],
-            "lifetime": {
-                "media_loads": val("0x14", "Lifetime media loads"),
-                "power_on_hours": val("0x14", "Lifetime power on hours"),
-                "media_motion_hours": val("0x14", "Lifetime media motion (head) hours"),
-                "metres_of_tape": val("0x14", "Lifetime metres of tape processed"),
-                "power_cycles": val("0x14", "Lifetime power cycles"),
-                "cleaning_operations": val("0x14", "Lifetime cleaning operations"),
-                "hours_since_cleaning": val("0x14", "Media motion (head) hours since last successful cleaning operation"),
-            },
-            "errors": {
-                "hard_write": val("0x14", "Hard write errors"),
-                "hard_read": val("0x14", "Hard read errors"),
-                "uncorrected_write": val("0x02", "Total uncorrected errors"),
-                "uncorrected_read": val("0x03", "Total uncorrected errors"),
-                "non_medium": val("0x06", "Non-medium error count"),
-                "write_retries": val("0x17", "Total write retries") or val("0x30", "Total write retries"),
-                "read_retries": val("0x17", "Total read retries") or val("0x30", "Total read retries"),
-            },
-            "duty_cycle_pct": {
-                "read": val("0x14", "Read duty cycle"),
-                "write": val("0x14", "Write duty cycle"),
-                "activity": val("0x14", "Activity duty cycle"),
-                "ready": val("0x14", "Ready duty cycle"),
-                "volume_not_present": val("0x14", "Volume not present duty cycle"),
-            },
-            "volume": {
-                "page_valid": val("0x17", "Page valid"),
-                "barcode": val("0x17", "Volume barcode"),
-                "serial": val("0x17", "Volume serial number"),
-                "personality": val("0x17", "Volume personality"),
-                "write_protect": val("0x17", "Write protect"),
-                "worm": val("0x17", "WORM"),
-                "total_native_capacity_mb": val("0x17", "Total native capacity"),
-                "used_native_capacity_mb": val("0x17", "Total used native capacity"),
-                "data_sets_written": val("0x17", "Total data sets written"),
-                "data_sets_read": val("0x17", "Total data sets read"),
-            },
-            "capacity_mib": {
-                "main_remaining": val("0x31", "Main partition remaining capacity (in MiB)"),
-                "main_maximum": val("0x31", "Main partition maximum capacity (in MiB)"),
-                "alt_remaining": val("0x31", "Alternate partition remaining capacity (in MiB)"),
-                "alt_maximum": val("0x31", "Alternate partition maximum capacity (in MiB)"),
-            },
-            "last_diagnostic_record": last_diag,
-            "supported_pages": len((pages.get("0x00") or {}).get("supported_pages", [])),
-            "command_id": rec["command_id"],
-        }
-        return summary
 
     def tapealert(self, sg):
         from app.commands import parsers
@@ -622,9 +271,25 @@ class LibraryService(BaseService):
                 "parsed": parsers.parse_mtx_status(rec["stdout"])}
 
     def inventory(self, changer):
+        """触发带库盘点重扫：mtx inventory（INITIALIZE ELEMENT STATUS，
+        机械臂会实际扫描槽位重新读条码，耗时与槽数相关）"""
+        from app.security.policy import normalize_device
+        changer_n = normalize_device(changer)
+        self._lock(changer_n)
+        try:
+            rec = self.ensure_pass(
+                self.exec(self.mtx.inventory(changer), "LIBRARY_INVENTORY", "LEVEL_2",
+                          device=changer_n, timeout=1800),
+                "COMMAND_FAILED", "mtx inventory failed")
+            return {"changer": changer_n, "command_id": rec["command_id"]}
+        finally:
+            self.runner.locks.release(changer_n)
+
+    def _status_inventory(self, changer):
+        """执行 mtx status 并解析为结构化槽位/驱动器清单（供 load 等内部逻辑使用）"""
         from app.security.policy import normalize_device
         changer = normalize_device(changer)
-        rec = self.exec(self.mtx.status(changer), "LIBRARY_INVENTORY", "LEVEL_1", device=changer, timeout=120)
+        rec = self.exec(self.mtx.status(changer), "LIBRARY_STATUS", "LEVEL_1", device=changer, timeout=120)
         slots, drives = [], []
         for line in rec["stdout"].splitlines():
             m = re.match(r"\s*Storage Element (\d+):(Full|Empty)\s*:?\s*VolumeTag=\s*(\S*)", line)
@@ -645,7 +310,7 @@ class LibraryService(BaseService):
     def load(self, changer, slot, drive):
         self._lock(changer)
         try:
-            inv = self.inventory(changer)
+            inv = self._status_inventory(changer)
             for d in inv["drives"]:
                 if d["drive"] == drive and d.get("barcode"):
                     raise ServiceError("MEDIA_ALREADY_LOADED", "drive %d already has media" % drive)
@@ -659,29 +324,6 @@ class LibraryService(BaseService):
     def unload(self, changer, slot, drive):
         self._lock(changer)
         try:
-            # BUGFIX 2026-09-11: target slot may be occupied (frontend default 6);
-            # fall back to the first empty storage slot so mtx unload does not fail
-            # with "Storage Element N is Already Full".
-            inv = self.inventory(changer)
-            if slot:
-                target_full = any(x.get("slot") == slot and x.get("occupied") for x in inv["slots"])
-                if target_full:
-                    empty = sorted([x["slot"] for x in inv["slots"] if not x.get("occupied")])
-                    if not empty:
-                        raise ServiceError("NO_EMPTY_SLOT", "target slot %s full and no empty slot available" % slot)
-                    slot = empty[0]
-            else:
-                empty = sorted([x["slot"] for x in inv["slots"] if not x.get("occupied")])
-                if not empty:
-                    raise ServiceError("NO_EMPTY_SLOT", "no empty slot available for unload")
-                slot = empty[0]
-            drv = next((d for d in inv["drives"] if d["drive"] == drive), None)
-            if drv is None:
-                raise ServiceError("DRIVE_NOT_FOUND", "drive %d not found in library" % drive)
-            if not drv.get("occupied"):
-                raise ServiceError("DRIVE_EMPTY",
-                                   "drive %d (%s) is empty: nothing to unload"
-                                   % (drive, drv.get("nst_device") or "DTE %d" % drive))
             rec = self.ensure_pass(
                 self.exec(self.mtx.unload(changer, slot, drive), "LIBRARY_UNLOAD", "LEVEL_2", device=changer, timeout=300),
                 "COMMAND_FAILED", "mtx unload failed")
@@ -709,48 +351,55 @@ class LibraryService(BaseService):
         finally:
             self.runner.locks.release(changer)
 
+    def exchange(self, changer, source, destination):
+        self._lock(changer)
+        try:
+            rec = self.ensure_pass(
+                self.exec(self.mtx.exchange(changer, source, destination), "LIBRARY_EXCHANGE", "LEVEL_2",
+                          device=changer, timeout=300),
+                "COMMAND_FAILED", "mtx exchange failed")
+            return {"source": source, "destination": destination, "command_id": rec["command_id"]}
+        finally:
+            self.runner.locks.release(changer)
+
+    def first(self, changer):
+        rec = self.ensure_pass(
+            self.exec(self.mtx.first(changer), "LIBRARY_FIRST", "LEVEL_1", device=changer, timeout=120),
+            "COMMAND_FAILED", "mtx first failed")
+        return {"stdout": rec["stdout"], "command_id": rec["command_id"]}
+
+    def next(self, changer):
+        rec = self.ensure_pass(
+            self.exec(self.mtx.next(changer), "LIBRARY_NEXT", "LEVEL_1", device=changer, timeout=120),
+            "COMMAND_FAILED", "mtx next failed")
+        return {"stdout": rec["stdout"], "command_id": rec["command_id"]}
+
+    def last(self, changer):
+        """仿真 mtx last：mtx 自带的 last 在 IE 槽与存储槽同段编号的库上会误判
+        最后一盘磁带的位置，这里改为自行解析 status 后精确装载。"""
+        from app.security.policy import normalize_device
+        self._lock(changer)
+        try:
+            st = self.status(changer)
+            slots = [s for s in st["parsed"]["slots"]
+                     if s["occupied"] and not s.get("import_export")]
+            if not slots:
+                raise ServiceError("MEDIA_NOT_FOUND", "no tape in regular storage slots")
+            last_slot = max(slots, key=lambda s: s["element"])
+            rec = self.ensure_pass(
+                self.exec(self.mtx.load(changer, last_slot["element"], 0), "LIBRARY_LAST",
+                          "LEVEL_2", device=normalize_device(changer), timeout=300),
+                "COMMAND_FAILED", "load last tape (slot %d) failed" % last_slot["element"])
+            return {"slot": last_slot["element"], "barcode": last_slot.get("barcode"),
+                    "drive": 0, "command_id": rec["command_id"]}
+        finally:
+            self.runner.locks.release(changer)
+
 
 class DriveService(BaseService):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.mt = MtAdapter()
-
-    def _find_sg_for_nst(self, nst):
-        import re as _re
-        from app.commands.adapters import LsscsiAdapter
-        nst = nst if nst.startswith("/dev/") else "/dev/" + nst
-        st = nst.replace("/dev/nst", "/dev/st")
-        rec = self.ensure_pass(self.exec(LsscsiAdapter().list_all(), "DISCOVERY", "LEVEL_1"))
-        for line in rec["stdout"].splitlines():
-            if _re.search(_re.escape(st) + r"(\s|$)", line):
-                m = _re.search(r"(/dev/sg\d+)\s*$", line)
-                if m:
-                    return m.group(1), nst
-        return None, nst
-
-    def summary(self, nst):
-        """Aggregate all drive info: identity (sg_inq), mt status, compression, tapealert."""
-        from app.commands import parsers
-        from app.commands.adapters import SgAdapter
-        sg = SgAdapter()
-        sg_dev, nst_full = self._find_sg_for_nst(nst)
-        out = {"nst_device": nst_full, "sg_device": sg_dev}
-        if sg_dev:
-            inq = self.ensure_pass(self.exec(sg.inquiry(sg_dev), "INQUIRY", "LEVEL_1", device=sg_dev),
-                                   "DEVICE_NOT_FOUND")
-            out["identity"] = parsers.parse_sg_inq(inq["stdout"])
-            out["identity"]["command_id"] = inq["command_id"]
-            ta = self.exec(sg.tapealert(sg_dev), "TAPEALERT", "LEVEL_1", device=sg_dev)
-            out["tapealert"] = {"command_id": ta["command_id"],
-                                "alerts": parsers.parse_tapealert(ta["stdout"]).get("alerts", [])}
-        st = self.ensure_pass(self.exec(self.mt.status(nst_full), "DRIVE_STATUS", "LEVEL_1", device=nst_full),
-                              "DRIVE_NOT_FOUND")
-        out["status"] = parsers.parse_mt_status(st["stdout"])
-        out["status"]["command_id"] = st["command_id"]
-        comp = self.exec(self.mt.compression(nst_full), "DRIVE_COMPRESSION", "LEVEL_1", device=nst_full)
-        out["compression"] = parsers.parse_mt_compression(comp["stdout"])
-        out["compression"]["command_id"] = comp["command_id"]
-        return out
 
     def status(self, nst):
         from app.commands import parsers
@@ -760,20 +409,6 @@ class DriveService(BaseService):
                 "parsed": parsers.parse_mt_status(rec["stdout"])}
 
     def position(self, nst, operation, count):
-        # pre-check: refuse positioning operations on empty drive
-        # (mt rewind/seek on a no-medium drive can hang in the kernel)
-        from app.commands import parsers
-        nst_full = nst if nst.startswith("/dev/") else "/dev/" + nst
-        srec = self.ensure_pass(self.exec(self.mt.status(nst_full), "DRIVE_STATUS", "LEVEL_1", device=nst_full))
-        sp = parsers.parse_mt_status(srec["stdout"])
-        if "DR_OPEN" in (sp.get("flags") or []):
-            if operation in ("offline", "eject"):
-                # idempotent: drive already empty, and mt offline would hang
-                # in the kernel on a no-medium drive
-                return {"operation": operation, "count": count,
-                        "result": "already_empty_noop", "command_id": srec["command_id"]}
-            raise ServiceError("NO_MEDIUM", "no medium loaded in %s: cannot %s" % (nst_full, operation),
-                               srec)
         rec = self.ensure_pass(
             self.exec(self.mt.position(nst, operation, count), "DRIVE_POSITION", "LEVEL_2", device=nst, timeout=600),
             "COMMAND_FAILED")
@@ -782,6 +417,113 @@ class DriveService(BaseService):
     def rewind(self, nst):
         return self.position(nst, "rewind", 0)
 
+    def _simple(self, nst, argv, phase, risk, timeout=600, fail="COMMAND_FAILED"):
+        rec = self.ensure_pass(self.exec(argv, phase, risk, device=nst, timeout=timeout), fail)
+        return {"command_id": rec["command_id"], "stdout": rec["stdout"], "stderr": rec["stderr"],
+                "exit_code": rec["exit_code"]}
+
+    def wset(self, nst, count):
+        rec = self.ensure_pass(
+            self.exec(self.mt.wset(nst, count), "DRIVE_WSET", "LEVEL_3", device=nst, timeout=600),
+            "COMMAND_FAILED", "mt wset failed")
+        return {"count": count, "command_id": rec["command_id"]}
+
+    def eof(self, nst, count):
+        return self.weof(nst, count)  # `mt eof` is an alias of `mt weof`
+
+    def offline(self, nst):
+        return self.position(nst, "offline", 0)
+
+    def rewoffl(self, nst):
+        return self._simple(nst, self.mt.rewoffl(nst), "DRIVE_REWOFFL", "LEVEL_2")
+
+    def eject(self, nst):
+        return self._simple(nst, self.mt.eject(nst), "DRIVE_EJECT", "LEVEL_2")
+
+    def retension(self, nst):
+        return self._simple(nst, self.mt.retension(nst), "DRIVE_RETENSION", "LEVEL_2", timeout=3600)
+
+    def eod(self, nst):
+        return self.position(nst, "eod", 0)
+
+    def seod(self, nst):
+        return self.position(nst, "seod", 0)
+
+    def seek(self, nst, count):
+        rec = self.ensure_pass(
+            self.exec(self.mt.seek(nst, count), "DRIVE_SEEK", "LEVEL_2", device=nst, timeout=600),
+            "COMMAND_FAILED", "mt seek failed")
+        return {"block": count, "command_id": rec["command_id"]}
+
+    def tell(self, nst):
+        rec = self.ensure_pass(self.exec(self.mt.tell(nst), "DRIVE_TELL", "LEVEL_1", device=nst),
+                               "COMMAND_FAILED", "mt tell failed")
+        return {"stdout": rec["stdout"], "command_id": rec["command_id"]}
+
+    def erase(self, nst, count=0):
+        rec = self.ensure_pass(
+            self.exec(self.mt.erase(nst, count), "DRIVE_ERASE", "LEVEL_3", device=nst, timeout=3600),
+            "COMMAND_FAILED", "mt erase failed")
+        return {"command_id": rec["command_id"]}
+
+    def lock(self, nst):
+        return self._simple(nst, self.mt.lock(nst), "DRIVE_LOCK", "LEVEL_2")
+
+    def unlock(self, nst):
+        return self._simple(nst, self.mt.unlock(nst), "DRIVE_UNLOCK", "LEVEL_2")
+
+    def load(self, nst):
+        return self._simple(nst, self.mt.load(nst), "DRIVE_LOAD", "LEVEL_2")
+
+    def compression_set(self, nst, enable):
+        rec = self.ensure_pass(
+            self.exec(self.mt.compression_set(nst, enable), "DRIVE_COMPRESSION", "LEVEL_2",
+                      device=nst, timeout=600),
+            "COMMAND_FAILED", "mt compression set failed")
+        return {"enabled": bool(enable), "command_id": rec["command_id"]}
+
+    def setblk(self, nst, block_size):
+        rec = self.ensure_pass(
+            self.exec(self.mt.setblk(nst, block_size), "DRIVE_SETBLK", "LEVEL_2", device=nst),
+            "COMMAND_FAILED", "mt setblk failed")
+        return {"block_size": block_size, "command_id": rec["command_id"]}
+
+    def setdensity(self, nst, density):
+        rec = self.ensure_pass(
+            self.exec(self.mt.setdensity(nst, density), "DRIVE_SETDENSITY", "LEVEL_2", device=nst),
+            "COMMAND_FAILED", "mt setdensity failed")
+        return {"density": density, "command_id": rec["command_id"]}
+
+    def setpartition(self, nst, partition):
+        rec = self.ensure_pass(
+            self.exec(self.mt.setpartition(nst, partition), "DRIVE_SETPARTITION", "LEVEL_2", device=nst),
+            "COMMAND_FAILED", "mt setpartition failed")
+        return {"partition": partition, "command_id": rec["command_id"]}
+
+    def mkpartition(self, nst, count):
+        rec = self.ensure_pass(
+            self.exec(self.mt.mkpartition(nst, count), "DRIVE_MKPARTITION", "LEVEL_3",
+                      device=nst, timeout=3600),
+            "COMMAND_FAILED", "mt mkpartition failed")
+        return {"count": count, "command_id": rec["command_id"]}
+
+    def partseek(self, nst, partition, block):
+        rec = self.ensure_pass(
+            self.exec(self.mt.partseek(nst, partition, block), "DRIVE_PARTSEEK", "LEVEL_2",
+                      device=nst, timeout=600),
+            "COMMAND_FAILED", "mt partseek failed")
+        return {"partition": partition, "block": block, "command_id": rec["command_id"]}
+
+    def densities(self, nst):
+        rec = self.ensure_pass(self.exec(self.mt.densities(nst), "DRIVE_DENSITIES", "LEVEL_1", device=nst),
+                               "COMMAND_FAILED", "mt densities failed")
+        return {"stdout": rec["stdout"], "command_id": rec["command_id"]}
+
+    def stshowoptions(self, nst):
+        rec = self.ensure_pass(self.exec(self.mt.stshowoptions(nst), "DRIVE_OPTIONS", "LEVEL_1", device=nst),
+                               "COMMAND_FAILED", "mt stshowoptions failed")
+        return {"stdout": rec["stdout"], "command_id": rec["command_id"]}
+
     def compression(self, nst):
         from app.commands import parsers
         rec = self.exec(self.mt.compression(nst), "DRIVE_COMPRESSION", "LEVEL_1", device=nst)
@@ -789,22 +531,10 @@ class DriveService(BaseService):
                 "parsed": parsers.parse_mt_compression(rec["stdout"])}
 
     def weof(self, nst, count):
-        from app.commands import parsers
-        nst_full = nst if nst.startswith("/dev/") else "/dev/" + nst
         rec = self.ensure_pass(
-            self.exec(self.mt.weof(nst_full, count), "DRIVE_WEOF", "LEVEL_3", device=nst_full, timeout=600),
+            self.exec(self.mt.weof(nst, count), "DRIVE_WEOF", "LEVEL_3", device=nst, timeout=600),
             "COMMAND_FAILED", "mt weof failed")
-        # post-write position for verification
-        position = {}
-        try:
-            srec = self.ensure_pass(self.exec(self.mt.status(nst_full), "DRIVE_STATUS", "LEVEL_1", device=nst_full))
-            sp = parsers.parse_mt_status(srec["stdout"])
-            position = {k: sp.get(k) for k in ("file_number", "block_number", "partition")}
-            position["flags"] = sp.get("flags")
-        except Exception:
-            pass
-        return {"device": nst_full, "operation": "weof", "count": count,
-                "position_after": position, "command_id": rec["command_id"]}
+        return {"count": count, "command_id": rec["command_id"]}
 
 
 class DiagnosticService(BaseService):
@@ -820,7 +550,6 @@ class DiagnosticService(BaseService):
     def dmesg_log(self, tail=100):
         """1:1 for CLI: dmesg | grep -Ei 'tape|changer|scsi|st[0-9]|sg[0-9]|...' | tail -N"""
         import re as _re
-        from app.commands import parsers
         rec = self.exec(["dmesg"], "SYSTEM_DIAG", "LEVEL_1", timeout=60)
         pat = _re.compile(r"tape|changer|scsi|st\d|sg\d|lto|ibm|quantum", _re.I)
         lines = [ln for ln in rec["stdout"].splitlines() if pat.search(ln)]
@@ -829,7 +558,6 @@ class DiagnosticService(BaseService):
         return {"filter": "tape|changer|scsi|st[0-9]|sg[0-9]|lto|ibm|quantum (case-insensitive)",
                 "tail": tail, "matched_lines": len(lines),
                 "stdout": "\n".join(sel), "command_id": rec["command_id"],
-                "device_map": parsers.parse_dmesg_device_map(rec["stdout"]),
                 "parsed": {"lines": sel, "total_matched": len(lines), "shown": len(sel),
                            "parsed_ok": True}}
 
@@ -851,24 +579,31 @@ class DiagnosticService(BaseService):
 
 
 class TestService(BaseService):
-    def read_test(self, drive, block_size, confirm, timeout):
+    def read_test(self, drive, block_size, confirm, timeout, out_file=""):
         if not confirm:
             raise ServiceError("INVALID_REQUEST", "confirm=true required")
-        from app.security.policy import normalize_device
+        from app.security.policy import normalize_device, validate_output_path
         dev = normalize_device(drive)
+        out = "/dev/null"
+        if out_file:
+            out = validate_output_path(out_file)
         if not self.runner.locks.acquire(dev):
             raise ServiceError("DEVICE_BUSY", "drive busy")
         try:
-            rec = self.exec(["dd", "if=" + dev, "of=/dev/null", "bs=" + block_size],
+            rec = self.exec(["dd", "if=" + dev, "of=" + out, "bs=" + block_size],
                             "READ_TEST", "LEVEL_2", device=dev, timeout=timeout)
             self.ensure_pass(rec, "COMMAND_FAILED", "dd read failed")
             from app.commands import parsers
-            return {"drive": dev, "duration_ms": rec["duration_ms"], "command_id": rec["command_id"],
+            data = {"drive": dev, "duration_ms": rec["duration_ms"], "command_id": rec["command_id"],
                     "parsed": parsers.parse_dd_summary(rec["stderr"])}
+            if out != "/dev/null":
+                data["file"] = out
+            return data
         finally:
             self.runner.locks.release(dev)
 
-    def write_test(self, drive, test_media, size_mb, allow_write, confirm, timeout):
+    def write_test(self, drive, test_media, size_mb, allow_write, confirm, timeout, in_file=""):
+        import os
         from app.config import settings
         if not (allow_write and settings.allow_write):
             raise ServiceError("WRITE_OPERATION_NOT_AUTHORIZED",
@@ -876,19 +611,32 @@ class TestService(BaseService):
         if not confirm:
             raise ServiceError("INVALID_REQUEST", "confirm=true required")
         if not test_media:
-            raise ServiceError("MISSING_PARAMETER", "test_media required for write test")
-        from app.security.policy import normalize_device
+            raise ServiceError("MISSING_PARAMETER", "media required for write test")
+        from app.security.policy import normalize_device, validate_input_path
         dev = normalize_device(drive)
+        src = None
+        if in_file:
+            src = validate_input_path(in_file)
+            if not os.path.isfile(src):
+                raise ServiceError("FILE_NOT_FOUND", "input file not found: %s" % src)
         if not self.runner.locks.acquire(dev):
             raise ServiceError("DEVICE_BUSY", "drive busy")
         try:
-            rec = self.exec(["dd", "if=/dev/zero", "of=" + dev, "bs=1M", "count=" + str(size_mb)],
-                            "WRITE_TEST", "LEVEL_3", device=dev, timeout=timeout)
+            if src:
+                argv = ["dd", "if=" + src, "of=" + dev, "bs=1M", "conv=notrunc"]
+            else:
+                argv = ["dd", "if=/dev/zero", "of=" + dev, "bs=1M", "count=" + str(size_mb)]
+            rec = self.exec(argv, "WRITE_TEST", "LEVEL_3", device=dev, timeout=timeout)
             self.ensure_pass(rec, "COMMAND_FAILED", "dd write failed")
             from app.commands import parsers
-            return {"drive": dev, "size_mb": size_mb, "duration_ms": rec["duration_ms"],
+            data = {"drive": dev, "duration_ms": rec["duration_ms"],
                     "command_id": rec["command_id"],
                     "parsed": parsers.parse_dd_summary(rec["stderr"])}
+            if src:
+                data["file"] = src
+            else:
+                data["size_mb"] = size_mb
+            return data
         finally:
             self.runner.locks.release(dev)
 
@@ -980,3 +728,70 @@ class TestService(BaseService):
         diag = DiagnosticService(self.runner, self.chain, self.request_id)
         results["system_diag"] = diag.system()
         return results
+
+
+class ScsiService(BaseService):
+    """SCSI 通用设备操作：sg_inq / sg_vpd / sg_logs / sg_logs -p 0x2e / sg_reset / sg_persist"""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.sg = SgAdapter()
+
+    def inquiry(self, device):
+        from app.security.policy import normalize_device
+        from app.commands import parsers
+        dev = normalize_device(device)
+        rec = self.ensure_pass(self.exec(self.sg.inquiry(dev), "SCSI_INQUIRY", "LEVEL_1", device=dev),
+                               "DEVICE_NOT_FOUND")
+        return {"device": dev, "stdout": rec["stdout"], "command_id": rec["command_id"],
+                "parsed": parsers.parse_sg_inq(rec["stdout"])}
+
+    def vpd(self, device, page="0x80"):
+        from app.security.policy import normalize_device
+        from app.commands import parsers
+        dev = normalize_device(device)
+        rec = self.ensure_pass(self.exec(self.sg.vpd(dev, page), "SCSI_VPD", "LEVEL_1", device=dev),
+                               "COMMAND_FAILED")
+        return {"device": dev, "page": page, "stdout": rec["stdout"],
+                "command_id": rec["command_id"], "parsed": parsers.parse_sg_vpd(rec["stdout"])}
+
+    def logs(self, device, page=None):
+        import re as _re
+        from app.security.policy import normalize_device
+        dev = normalize_device(device)
+        if page is not None and not _re.match(r"^0x[0-9a-fA-F]{1,4}$", page):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail={"code": "INVALID_REQUEST",
+                                                         "message": "page must be hex like 0x2e"})
+        argv = ["sg_logs"] + (["-p", page] if page else []) + [dev]
+        rec = self.ensure_pass(self.exec(argv, "SCSI_LOGS", "LEVEL_1", device=dev),
+                               "COMMAND_FAILED")
+        return {"device": dev, "stdout": rec["stdout"], "command_id": rec["command_id"]}
+
+    def tapealert(self, device):
+        from app.security.policy import normalize_device
+        dev = normalize_device(device)
+        rec = self.ensure_pass(self.exec(self.sg.tapealert(dev), "SCSI_TAPEALERT", "LEVEL_1",
+                                          device=dev), "COMMAND_FAILED")
+        return {"device": dev, "stdout": rec["stdout"], "command_id": rec["command_id"]}
+
+    def persist(self, device):
+        from app.security.policy import normalize_device
+        dev = normalize_device(device)
+        rec = self.ensure_pass(self.exec(["sg_persist", dev], "SCSI_PERSIST", "LEVEL_1", device=dev),
+                               "COMMAND_FAILED")
+        return {"device": dev, "stdout": rec["stdout"], "command_id": rec["command_id"]}
+
+    def reset(self, device, confirm):
+        from app.security.policy import normalize_device
+        dev = normalize_device(device)
+        if not confirm:
+            raise ServiceError("INVALID_REQUEST", "confirm=true required")
+        if not self.runner.locks.acquire(dev):
+            raise ServiceError("DEVICE_BUSY", "device busy")
+        try:
+            rec = self.ensure_pass(self.exec(["sg_reset", "-d", dev], "SCSI_RESET", "LEVEL_2",
+                                              device=dev, timeout=120),
+                                   "RESET_FAILED", "sg_reset failed")
+            return {"device": dev, "reset": "device", "command_id": rec["command_id"]}
+        finally:
+            self.runner.locks.release(dev)

@@ -168,14 +168,15 @@ class TestLibraryAPI:
         changers = r.json()["data"]
         assert changers[0]["sg_device"] == "/dev/sg1"
 
-    def test_inventory_parsing(self, monkeypatch):
-        c = make_client([(0, MTX_STATUS, "")], monkeypatch)
+    def test_inventory_triggers_mtx_inventory(self, monkeypatch):
+        c = make_client([], monkeypatch, mode="FULL")
         r = c.get("/api/v1/libraries/sg1/inventory")
-        data = r.json()["data"]
-        assert data["library"]["changer"] == "/dev/sg1"
-        slots = {s["slot"]: s for s in data["slots"]}
-        assert slots[1]["barcode"] == "IBM006LA" and slots[1]["occupied"] is True
-        assert data["drives"][1]["occupied"] is True
+        b = r.json()
+        assert r.status_code == 200, r.text
+        assert b["code"] == "INVENTORY_SUCCESS"
+        assert b["data"]["changer"] == "/dev/sg1"
+        argv, _ = c.app.state.runner.calls[-1]
+        assert argv == ["mtx", "-f", "/dev/sg1", "inventory"]
 
     def test_load_success(self, monkeypatch):
         script = [(0, MTX_STATUS, ""), (0, "Loading media...done\n", "")]
@@ -250,9 +251,30 @@ class TestDriveAPI:
 class TestIOAPI:
     def test_read_success(self, monkeypatch):
         c = make_client([(0, "1024+0 records in\n", "1073741824 bytes copied\n")], monkeypatch)
-        r = c.post("/api/v1/tests/read", json={"drive": "/dev/nst1", "block_size": "1M", "confirm": True})
+        r = c.post("/api/v1/read", json={"drive": "/dev/nst1", "block_size": "1M", "confirm": True})
         body = r.json()
-        assert body["code"] == "READ_TEST_PASS" and "command_id" in body["data"]
+        assert body["code"] == "READ_SUCCESS" and "command_id" in body["data"]
+
+    def test_read_to_file(self, monkeypatch):
+        c = make_client([(0, "", "512 bytes copied\n")], monkeypatch)
+        r = c.post("/api/v1/read", json={"drive": "/dev/nst1", "block_size": "1M",
+                                         "file": "/root/f2", "confirm": True})
+        body = r.json()
+        assert body["code"] == "READ_SUCCESS" and body["data"]["file"] == "/root/f2"
+        argv, _ = c.app.state.runner.calls[-1]
+        assert argv == ["dd", "if=/dev/nst1", "of=/root/f2", "bs=1M"]
+
+    def test_read_rejects_bad_file(self, monkeypatch):
+        c = make_client([(0, "", "")], monkeypatch)
+        r = c.post("/api/v1/read", json={"drive": "/dev/nst1", "file": "relative/x", "confirm": True})
+        assert r.status_code == 400
+        r = c.post("/api/v1/read", json={"drive": "/dev/nst1", "file": "/dev/nst0", "confirm": True})
+        assert r.status_code == 400
+
+    def test_read_legacy_alias(self, monkeypatch):
+        c = make_client([(0, "", "")], monkeypatch)
+        r = c.post("/api/v1/tests/read", json={"drive": "/dev/nst1", "block_size": "1M", "confirm": True})
+        assert r.json()["code"] == "READ_SUCCESS"
 
     def test_read_requires_confirm(self, monkeypatch):
         c = make_client([(0, "", "")], monkeypatch)
@@ -264,7 +286,7 @@ class TestIOAPI:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([], None)
-        r = c.post("/api/v1/tests/write",
+        r = c.post("/api/v1/write",
                    json={"drive": "/dev/nst1", "size_mb": 1024, "allow_write": False, "confirm": True})
         assert r.status_code == 403
         assert r.json()["detail"]["code"] == "WRITE_OPERATION_NOT_AUTHORIZED"
@@ -274,10 +296,55 @@ class TestIOAPI:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([(0, "1024+0 records out\n", "1073741824 bytes copied\n")], None)
-        r = c.post("/api/v1/tests/write",
-                   json={"drive": "/dev/nst1", "test_media": "IBM015LA", "size_mb": 1024,
+        r = c.post("/api/v1/write",
+                   json={"drive": "/dev/nst1", "media": "IBM015LA", "size_mb": 1024,
                          "allow_write": True, "confirm": True})
-        assert r.json()["code"] == "WRITE_TEST_PASS"
+        assert r.json()["code"] == "WRITE_SUCCESS"
+        argv, _ = c.app.state.runner.calls[-1]
+        assert argv == ["dd", "if=/dev/zero", "of=/dev/nst1", "bs=1M", "count=1024"]
+
+    def test_write_legacy_alias(self, monkeypatch):
+        import app.config as cfg
+        monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
+        monkeypatch.setattr(cfg.settings, "allow_write", True)
+        c = make_client([(0, "", "")], None)
+        r = c.post("/api/v1/tests/write",
+                   json={"drive": "/dev/nst1", "test_media": "IBM015LA", "size_mb": 1,
+                         "allow_write": True, "confirm": True})
+        assert r.json()["code"] == "WRITE_SUCCESS"
+
+    def test_write_from_file(self, monkeypatch, tmp_path):
+        import app.config as cfg
+        monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
+        monkeypatch.setattr(cfg.settings, "allow_write", True)
+        f = tmp_path / "f1.bin"
+        f.write_bytes(b"x" * 4096)
+        c = make_client([(0, "", "4096 bytes copied\n")], None)
+        r = c.post("/api/v1/write",
+                   json={"drive": "/dev/nst1", "media": "IBM015LA", "file": str(f),
+                         "allow_write": True, "confirm": True})
+        body = r.json()
+        assert body["code"] == "WRITE_SUCCESS" and body["data"]["file"] == str(f)
+        argv, _ = c.app.state.runner.calls[-1]
+        assert argv == ["dd", "if=" + str(f), "of=/dev/nst1", "bs=1M", "conv=notrunc"]
+
+    def test_write_file_validation(self, monkeypatch):
+        import app.config as cfg
+        monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
+        monkeypatch.setattr(cfg.settings, "allow_write", True)
+        c = make_client([], None)
+        # 相对路径拒绝
+        r = c.post("/api/v1/write", json={"drive": "/dev/nst1", "media": "X",
+                                          "file": "rel/f", "allow_write": True, "confirm": True})
+        assert r.status_code == 400
+        # 设备路径拒绝
+        r = c.post("/api/v1/write", json={"drive": "/dev/nst1", "media": "X",
+                                          "file": "/dev/zero", "allow_write": True, "confirm": True})
+        assert r.status_code == 400
+        # 不存在文件拒绝
+        r = c.post("/api/v1/write", json={"drive": "/dev/nst1", "media": "X",
+                                          "file": "/no/such/file.bin", "allow_write": True, "confirm": True})
+        assert r.status_code in (400, 404)
 
     def test_erase_unauthorized(self, monkeypatch):
         import app.config as cfg
@@ -338,9 +405,17 @@ class TestAudit:
                      "/dependencies/{name}",
                      "/inquiry", "/vpd", "/tur", "/modes", "/logs",
                      "/libraries/{changer}/load", "/libraries/{changer}/inventory",
-                     "/drives/{nst_device}/status", "/drives/{nst_device}/position",
-                     "/drives/{nst_device}/weof", "/tapealert", "/diagnostics/system",
+                     "/drives/{drive}/status", "/drives/{drive}/position",
+                     "/drives/{drive}/weof", "/drives/{drive}/wset", "/drives/{drive}/eof",
+                     "/drives/{drive}/rewind", "/drives/{drive}/offline", "/drives/{drive}/rewoffl",
+                     "/drives/{drive}/eject", "/drives/{drive}/retension", "/drives/{drive}/eod",
+                     "/drives/{drive}/seod", "/drives/{drive}/seek", "/drives/{drive}/tell",
+                     "/drives/{drive}/densities", "/drives/{drive}/options", "/drives/{drive}/erase",
+                     "/drives/{drive}/lock", "/drives/{drive}/unlock", "/drives/{drive}/load",
+                     "/drives/{drive}/compression", "/drives/{drive}/block-size", "/drives/{drive}/density",
+                     "/drives/{drive}/partition", "/drives/{drive}/partition/seek",
+                     "/tapealert", "/diagnostics/system",
                      "/diagnostics/dmesg", "/diagnostics/journalctl",
-                     "/tests/read", "/tests/write", "/tests/write-verify",
+                     "/read", "/write", "/tests/write-verify",
                      "/tests/erase", "/tests/full", "/commands/{command_id}", "/audit/{request_id}"]:
             assert any(frag in p for p in paths), frag

@@ -60,11 +60,7 @@ OK, INVALID_REQUEST, MISSING_PARAMETER, INVALID_DEVICE, DEVICE_NOT_FOUND, DEVICE
 | POST /api/v1/libraries/{changer}/load | `mtx -f /dev/sgX load S D` | L2 |
 | POST /api/v1/libraries/{changer}/unload | `mtx -f /dev/sgX unload S D` | L2 |
 | POST /api/v1/libraries/{changer}/transfer | `mtx -f /dev/sgX transfer S D` | L2 |
-| POST /api/v1/libraries/{changer}/robot/position | `mtx -f /dev/sgX position E` | L2 |
-| POST /api/v1/libraries/{changer}/exchange | `mtx -f /dev/sgX exchange S D` | L2 |
-| POST /api/v1/libraries/{changer}/robot/first | `mtx -f /dev/sgX first` | L2 |
-| POST /api/v1/libraries/{changer}/robot/next | `mtx -f /dev/sgX next` | L2 |
-| POST /api/v1/libraries/{changer}/robot/last | `mtx -f /dev/sgX last` | L2 |
+| POST /api/v1/libraries/{changer}/position | `mtx -f /dev/sgX position E` | L2 |
 | GET /api/v1/drives/{drive}/status | `mt -f /dev/nstX status` | L1 |
 | POST /api/v1/drives/{drive}/weof | `mt -f /dev/nstX weof N` | L3 |
 | POST /api/v1/drives/{drive}/wset | `mt -f /dev/nstX wset N` | L3 |

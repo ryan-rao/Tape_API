@@ -119,11 +119,22 @@ async function realLibraries(): Promise<ApiResponse> {
     drive_count: 0, slot_count: 0, occupied_slots: 0, tape_count: 0, loaded_drives: 0,
     last_update: new Date().toISOString(),
   }));
+  // 去重：FC 多路径会导致同一物理库出现多个 sg 设备（如 sg1/sg3），
+  // 用 SCSI inquiry 序列号识别同一设备，只保留第一个
+  const seenSerials = new Set<string>();
+  const unique: typeof libs = [];
   for (const lib of libs) {
+    let serial = '';
+    const inq = await get(`/scsi/${lib.changer}/inquiry`).catch(() => null);
+    serial = inq?.data?.parsed?.unit_serial_number || '';
+    if (serial && seenSerials.has(serial)) continue; // 同一物理库的另一条路径，跳过
+    if (serial) seenSerials.add(serial);
+    lib.serial = serial;
     const st = await get(`/libraries/${lib.changer}/status`);
     if (st.success && st.data?.parsed) fillCounts(lib, st.data.parsed);
+    unique.push(lib);
   }
-  return { ...r, data: libs };
+  return { ...r, data: unique };
 }
 
 async function realLibraryStatus(changer: string): Promise<ApiResponse> {
@@ -270,7 +281,7 @@ export const api = {
   runTest: (kind: TestKind, drive: string, sizeMb: number, tape?: string, barcodeInput?: string): Promise<ApiResponse> => {
     if (API_MODE === 'mock') return mockLogged('POST', `/tests/${kind === 'read' ? 'read' : 'write-verify'}`, kind === 'read' ? { nst_device: drive, size_mb: sizeMb } : { drive, test_media: tape, size_mb: sizeMb, allow_write: true, confirm: true }, () => mockApi.runTest(kind, drive, sizeMb, tape, barcodeInput));
     // 真实 API：读测试走 /tests/read；写走 /tests/write-verify（含读回校验）
-    if (kind === 'read') return post('/tests/read', { nst_device: drive, size_mb: sizeMb, block_size: 1048576 });
+    if (kind === 'read') return post('/read', { drive: drive.startsWith('/dev/') ? drive : `/dev/${drive}`, block_size: '1M', confirm: true });
     return post('/tests/write-verify', {
       drive: drive.startsWith('/dev/') ? drive : `/dev/${drive}`,
       test_media: tape || '', size_mb: sizeMb, allow_write: true, confirm: true,

@@ -2,6 +2,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.models.common import ok, fail
@@ -37,6 +38,31 @@ def handle(fn, request_id=""):
         elif e.code in ("COMMAND_FAILED", "TIMEOUT", "SCSI_ERROR"):
             status = 502
         raise HTTPException(status_code=status, detail={"code": e.code, "message": e.message})
+
+
+# ---------- async job helpers ----------
+def wants_sync(request: Request) -> bool:
+    """Long-running endpoints run as async jobs by default (202 + job_id).
+    CLI/legacy clients opt back into the old synchronous behavior with
+    query ?async=false or header X-Sync: true."""
+    if request.headers.get("x-sync", "").lower() == "true":
+        return True
+    return request.query_params.get("async", "true").lower() == "false"
+
+
+def submit_or_run(request: Request, name: str, target, devices=()):
+    """target: zero-arg callable returning the sync ApiResponse (or raising ServiceError)."""
+    if wants_sync(request):
+        return handle(target, request.state.request_id)
+    job = request.app.state.jobs.submit(name, request.url.path, target,
+                                        request_id=request.state.request_id,
+                                        devices=devices)
+    body = ok({"job_id": job.job_id, "state": job.state,
+               "poll_url": "/api/v1/jobs/%s" % job.job_id},
+              code="JOB_SUBMITTED",
+              message="job submitted; poll poll_url for status/result",
+              request_id=request.state.request_id)
+    return JSONResponse(status_code=202, content=body.model_dump())
 
 
 # ---------- System ----------
@@ -104,8 +130,9 @@ class InstallBody(BaseModel):
 @router.post("/dependencies/install", tags=["Dependencies"])
 def dependencies_install(body: InstallBody, request: Request):
     svc = build(request, DependencyService)
-    return handle(lambda: ok(svc.install(body.packages, body.confirm), code="DEPENDENCIES_INSTALLED",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "dependencies-install",
+                         lambda: ok(svc.install(body.packages, body.confirm), code="DEPENDENCIES_INSTALLED",
+                                    request_id=request.state.request_id))
 
 
 @router.get("/dependencies/verify", tags=["Dependencies"])
@@ -249,8 +276,9 @@ def library_inventory(changer: str, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.inventory(changer), code="INVENTORY_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "library-inventory",
+                         lambda: ok(svc.inventory(changer), code="INVENTORY_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 class ConfirmBody(BaseModel):
@@ -276,8 +304,9 @@ def library_load(changer: str, body: LoadBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.load(changer, body.slot, body.drive), code="LOAD_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "library-load",
+                         lambda: ok(svc.load(changer, body.slot, body.drive), code="LOAD_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/unload", tags=["Library"])
@@ -285,8 +314,9 @@ def library_unload(changer: str, body: LoadBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.unload(changer, body.slot, body.drive), code="UNLOAD_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "library-unload",
+                         lambda: ok(svc.unload(changer, body.slot, body.drive), code="UNLOAD_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/transfer", tags=["Library"])
@@ -294,8 +324,9 @@ def library_transfer(changer: str, body: TransferBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.transfer(changer, body.source, body.destination), code="TRANSFER_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "library-transfer",
+                         lambda: ok(svc.transfer(changer, body.source, body.destination), code="TRANSFER_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/position", tags=["Library"], include_in_schema=False)
@@ -304,8 +335,9 @@ def library_position(changer: str, body: PositionBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.position(changer, body.element), code="POSITION_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "library-position",
+                         lambda: ok(svc.position(changer, body.element), code="POSITION_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/robot/position", tags=["Library"])
@@ -313,8 +345,9 @@ def library_robot_position(changer: str, body: PositionBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.position(changer, body.element), code="POSITION_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "library-position",
+                         lambda: ok(svc.position(changer, body.element), code="POSITION_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/exchange", tags=["Library"])
@@ -322,29 +355,33 @@ def library_exchange(changer: str, body: TransferBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.exchange(changer, body.source, body.destination), code="EXCHANGE_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "library-exchange",
+                         lambda: ok(svc.exchange(changer, body.source, body.destination), code="EXCHANGE_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/robot/first", tags=["Library"])
 def library_robot_first(changer: str, request: Request):
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.first(changer), code="FIRST_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "robot-first",
+                         lambda: ok(svc.first(changer), code="FIRST_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/robot/next", tags=["Library"])
 def library_robot_next(changer: str, request: Request):
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.next(changer), code="NEXT_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "robot-next",
+                         lambda: ok(svc.next(changer), code="NEXT_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/robot/last", tags=["Library"])
 def library_robot_last(changer: str, request: Request):
     svc = build(request, LibraryService)
-    return handle(lambda: ok(svc.last(changer), code="LAST_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "robot-last",
+                         lambda: ok(svc.last(changer), code="LAST_SUCCESS",
+                                    request_id=request.state.request_id), devices=(changer,))
 
 
 # ---------- Drives ----------
@@ -391,8 +428,9 @@ def drive_weof(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.weof(drive, body.count), code="WEOF_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-weof",
+                         lambda: ok(svc.weof(drive, body.count), code="WEOF_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.post("/drives/{drive}/wset", tags=["Drive"])
@@ -400,8 +438,9 @@ def drive_wset(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.wset(drive, body.count), code="WSET_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-wset",
+                         lambda: ok(svc.wset(drive, body.count), code="WSET_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.post("/drives/{drive}/eof", tags=["Drive"])
@@ -409,8 +448,9 @@ def drive_eof(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.eof(drive, body.count), code="EOF_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-eof",
+                         lambda: ok(svc.eof(drive, body.count), code="EOF_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.post("/drives/{drive}/position", tags=["Drive"])
@@ -418,8 +458,9 @@ def drive_position(drive: str, body: DrivePositionBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.position(drive, body.operation, body.count), code="POSITION_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-position",
+                         lambda: ok(svc.position(drive, body.operation, body.count), code="POSITION_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.post("/drives/{drive}/rewind", tags=["Drive"])
@@ -463,8 +504,9 @@ def drive_retension(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.retension(drive), code="RETENSION_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-retension",
+                         lambda: ok(svc.retension(drive), code="RETENSION_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.post("/drives/{drive}/eod", tags=["Drive"])
@@ -472,8 +514,9 @@ def drive_eod(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.eod(drive), code="EOD_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-eod",
+                         lambda: ok(svc.eod(drive), code="EOD_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.post("/drives/{drive}/seod", tags=["Drive"])
@@ -481,8 +524,9 @@ def drive_seod(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.seod(drive), code="SEOD_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-seod",
+                         lambda: ok(svc.seod(drive), code="SEOD_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.post("/drives/{drive}/seek", tags=["Drive"])
@@ -490,8 +534,9 @@ def drive_seek(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.seek(drive, body.count), code="SEEK_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-seek",
+                         lambda: ok(svc.seek(drive, body.count), code="SEEK_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.get("/drives/{drive}/tell", tags=["Drive"])
@@ -520,8 +565,9 @@ def drive_erase(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, DriveService)
-    return handle(lambda: ok(svc.erase(drive, body.count), code="ERASE_SUCCESS",
-                             request_id=request.state.request_id))
+    return submit_or_run(request, "drive-erase",
+                         lambda: ok(svc.erase(drive, body.count), code="ERASE_SUCCESS",
+                                    request_id=request.state.request_id), devices=(drive,))
 
 
 @router.post("/drives/{drive}/lock", tags=["Drive"])
@@ -662,10 +708,12 @@ def api_write(body: WriteTestBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, TestService)
-    return handle(lambda: ok(svc.write_test(body.drive, _media_of(body), body.size_mb,
-                                            body.allow_write, body.confirm, body.timeout,
-                                            in_file=getattr(body, "file", "")),
-                             code="WRITE_SUCCESS", request_id=request.state.request_id))
+    return submit_or_run(request, "write-test",
+                         lambda: ok(svc.write_test(body.drive, _media_of(body), body.size_mb,
+                                                   body.allow_write, body.confirm, body.timeout,
+                                                   in_file=getattr(body, "file", "")),
+                                    code="WRITE_SUCCESS", request_id=request.state.request_id),
+                         devices=(body.drive,))
 
 
 @router.post("/tests/write", tags=["Tests"], include_in_schema=False)
@@ -684,9 +732,11 @@ def api_read(body: ReadTestBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, TestService)
-    return handle(lambda: ok(svc.read_test(body.drive, body.block_size, body.confirm, body.timeout,
-                                            getattr(body, "file", "")),
-                             code="READ_SUCCESS", request_id=request.state.request_id))
+    return submit_or_run(request, "read-test",
+                         lambda: ok(svc.read_test(body.drive, body.block_size, body.confirm, body.timeout,
+                                                  getattr(body, "file", "")),
+                                    code="READ_SUCCESS", request_id=request.state.request_id),
+                         devices=(body.drive,))
 
 
 @router.post("/tests/read", tags=["Tests"], include_in_schema=False)
@@ -708,9 +758,11 @@ def tests_write_verify(body: WriteVerifyBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, TestService)
-    return handle(lambda: ok(svc.write_verify(body.drive, body.test_media, body.size_mb,
-                                              body.allow_write, body.confirm, body.timeout),
-                             code="WRITE_VERIFY_PASS", request_id=request.state.request_id))
+    return submit_or_run(request, "write-verify",
+                         lambda: ok(svc.write_verify(body.drive, body.test_media, body.size_mb,
+                                                     body.allow_write, body.confirm, body.timeout),
+                                    code="WRITE_VERIFY_PASS", request_id=request.state.request_id),
+                         devices=(body.drive,))
 
 
 @router.post("/tests/erase", tags=["Tests"])
@@ -718,8 +770,10 @@ def tests_erase(body: EraseBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, TestService)
-    return handle(lambda: ok(svc.erase(body.drive, body.allow_write, body.confirm),
-                             code="ERASE_COMPLETED", request_id=request.state.request_id))
+    return submit_or_run(request, "erase",
+                         lambda: ok(svc.erase(body.drive, body.allow_write, body.confirm),
+                                    code="ERASE_COMPLETED", request_id=request.state.request_id),
+                         devices=(body.drive,))
 
 
 @router.post("/tests/full", tags=["Tests"])
@@ -728,7 +782,68 @@ def tests_full(request: Request):
     def _go():
         data = svc.full_test()
         return ok(data, code="FULL_TEST_COMPLETED", request_id=request.state.request_id)
-    return handle(_go)
+    return submit_or_run(request, "full-test", _go)
+
+
+# ---------- Jobs ----------
+@router.get("/jobs", tags=["Jobs"])
+def jobs_list(request: Request, status: str = None, limit: int = 50, offset: int = 0):
+    data = request.app.state.jobs.list(status=status, limit=limit, offset=offset)
+    return ok(data, code="OK", request_id=request.state.request_id)
+
+
+@router.get("/jobs/{job_id}", tags=["Jobs"])
+def jobs_get(job_id: str, request: Request):
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        return fail("JOB_NOT_FOUND", "unknown job id", request_id=request.state.request_id)
+    d = job.to_dict()
+    d["audit_url"] = "/api/v1/audit/%s" % job.request_id if job.request_id else None
+    return ok(d, code="OK", request_id=request.state.request_id)
+
+
+@router.post("/jobs/{job_id}/cancel", tags=["Jobs"])
+def jobs_cancel(job_id: str, request: Request):
+    job = request.app.state.jobs.cancel(job_id)
+    if job is None:
+        return fail("JOB_NOT_FOUND", "unknown job id", request_id=request.state.request_id)
+    return ok(job.to_dict(brief=True), code="CANCEL_REQUESTED",
+              message="cancel requested" if job.cancel_requested else "job already finished",
+              request_id=request.state.request_id)
+
+
+@router.get("/jobs/{job_id}/progress", tags=["Jobs"])
+def jobs_progress(job_id: str, request: Request):
+    """轻量进度查询（轮询友好）：仅状态与进度字段，不含 result/steps 明细."""
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        return fail("JOB_NOT_FOUND", "unknown job id", request_id=request.state.request_id)
+    return ok({
+        "job_id": job.job_id,
+        "name": job.name,
+        "state": job.state,
+        "progress": job.progress,
+        "started_at": job.started_at,
+        "duration_ms": job.duration_ms,
+        "cancel_requested": job.cancel_requested,
+    }, code="OK", request_id=request.state.request_id)
+
+
+@router.get("/jobs/{job_id}/result", tags=["Jobs"])
+def jobs_result(job_id: str, request: Request):
+    """结果查询：终态返回完整载荷（result/error/commands）；未终态返回 NOT_FINISHED."""
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        return fail("JOB_NOT_FOUND", "unknown job id", request_id=request.state.request_id)
+    if job.state not in ("succeeded", "failed", "cancelled"):
+        return ok({"job_id": job.job_id, "state": job.state, "finished": False,
+                   "progress": job.progress,
+                   "message": "job not finished yet"},
+                  code="NOT_FINISHED", request_id=request.state.request_id)
+    d = job.to_dict()
+    d["finished"] = True
+    d["audit_url"] = "/api/v1/audit/%s" % job.request_id if job.request_id else None
+    return ok(d, code="OK", request_id=request.state.request_id)
 
 
 # ---------- Audit / Commands ----------

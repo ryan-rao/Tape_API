@@ -24,20 +24,25 @@ def build(request: Request, cls):
     return cls(request.app.state.runner, chain, rid)
 
 
+def _error_status(code):
+    """业务错误码 -> HTTP 状态码（同步 handle 与 /jobs/{id}/result 共用，保证异步结果与同步执行一致）."""
+    if code in ("DEVICE_NOT_FOUND", "LIBRARY_NOT_FOUND", "DRIVE_NOT_FOUND", "MEDIA_NOT_FOUND", "SLOT_NOT_FOUND"):
+        return 404
+    if code in ("PERMISSION_DENIED", "WRITE_OPERATION_NOT_AUTHORIZED", "DESTRUCTIVE_OPERATION_NOT_AUTHORIZED"):
+        return 403
+    if code == "DEVICE_BUSY":
+        return 409
+    if code in ("COMMAND_FAILED", "TIMEOUT", "SCSI_ERROR"):
+        return 502
+    return 400
+
+
 def handle(fn, request_id=""):
     try:
         return fn()
     except ServiceError as e:
-        status = 400
-        if e.code in ("DEVICE_NOT_FOUND", "LIBRARY_NOT_FOUND", "DRIVE_NOT_FOUND", "MEDIA_NOT_FOUND", "SLOT_NOT_FOUND"):
-            status = 404
-        elif e.code in ("PERMISSION_DENIED", "WRITE_OPERATION_NOT_AUTHORIZED", "DESTRUCTIVE_OPERATION_NOT_AUTHORIZED"):
-            status = 403
-        elif e.code == "DEVICE_BUSY":
-            status = 409
-        elif e.code in ("COMMAND_FAILED", "TIMEOUT", "SCSI_ERROR"):
-            status = 502
-        raise HTTPException(status_code=status, detail={"code": e.code, "message": e.message})
+        raise HTTPException(status_code=_error_status(e.code),
+                            detail={"code": e.code, "message": e.message})
 
 
 # ---------- async job helpers ----------
@@ -831,7 +836,10 @@ def jobs_progress(job_id: str, request: Request):
 
 @router.get("/jobs/{job_id}/result", tags=["Jobs"])
 def jobs_result(job_id: str, request: Request):
-    """结果查询：终态返回完整载荷（result/error/commands）；未终态返回 NOT_FINISHED."""
+    """结果查询：返回与同步执行一致的业务信封。
+    成功：服务层原始信封（code=INVENTORY_SUCCESS 等业务码 + data），HTTP 200；
+    失败：与同步相同的错误码->状态码映射（502/404/409...）+ 错误信封；
+    均附 job_id/state/finished/command_ids/audit_url 供关联，job 明细仍走 GET /jobs/{id}."""
     job = request.app.state.jobs.get(job_id)
     if job is None:
         return fail("JOB_NOT_FOUND", "unknown job id", request_id=request.state.request_id)
@@ -840,10 +848,24 @@ def jobs_result(job_id: str, request: Request):
                    "progress": job.progress,
                    "message": "job not finished yet"},
                   code="NOT_FINISHED", request_id=request.state.request_id)
-    d = job.to_dict()
-    d["finished"] = True
-    d["audit_url"] = "/api/v1/audit/%s" % job.request_id if job.request_id else None
-    return ok(d, code="OK", request_id=request.state.request_id)
+    extra = {"job_id": job.job_id, "state": job.state, "finished": True,
+             "duration_ms": job.duration_ms, "command_ids": job.command_ids,
+             "audit_url": "/api/v1/audit/%s" % job.request_id if job.request_id else None}
+    rid = job.request_id or request.state.request_id
+    if job.state == "succeeded":
+        if isinstance(job.result, dict) and job.result.get("code"):
+            body = dict(job.result)   # 服务层原始信封（业务 code + data）
+        else:
+            body = ok(job.result, request_id=rid).model_dump()
+    elif job.state == "cancelled":
+        body = fail("CANCELLED", "job cancelled by user", request_id=rid).model_dump()
+    else:
+        err = job.error or {}
+        body = fail(err.get("code", "INTERNAL_ERROR"), err.get("message", "job failed"),
+                    request_id=rid).model_dump()
+    body.update(extra)
+    status = _error_status((job.error or {}).get("code", "")) if job.state == "failed" else 200
+    return JSONResponse(status_code=status, content=body)
 
 
 # ---------- Audit / Commands ----------

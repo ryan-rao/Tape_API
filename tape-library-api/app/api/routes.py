@@ -37,6 +37,14 @@ def _error_status(code):
     return 400
 
 
+def _require_confirm(confirmed):
+    """Physical-operation gate: clients must explicitly pass confirm=true."""
+    if not confirmed:
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_REQUEST",
+            "message": "confirm=true required for physical operations"})
+
+
 def handle(fn, request_id=""):
     try:
         return fn()
@@ -309,6 +317,7 @@ def library_load(changer: str, body: LoadBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "library-load",
                          lambda: ok(svc.load(changer, body.slot, body.drive), code="LOAD_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
@@ -319,6 +328,7 @@ def library_unload(changer: str, body: LoadBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "library-unload",
                          lambda: ok(svc.unload(changer, body.slot, body.drive), code="UNLOAD_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
@@ -329,6 +339,7 @@ def library_transfer(changer: str, body: TransferBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "library-transfer",
                          lambda: ok(svc.transfer(changer, body.source, body.destination), code="TRANSFER_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
@@ -340,6 +351,7 @@ def library_position(changer: str, body: PositionBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "library-position",
                          lambda: ok(svc.position(changer, body.element), code="POSITION_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
@@ -350,6 +362,7 @@ def library_robot_position(changer: str, body: PositionBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "library-position",
                          lambda: ok(svc.position(changer, body.element), code="POSITION_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
@@ -360,6 +373,7 @@ def library_exchange(changer: str, body: TransferBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "library-exchange",
                          lambda: ok(svc.exchange(changer, body.source, body.destination), code="EXCHANGE_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
@@ -433,6 +447,7 @@ def drive_weof(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-weof",
                          lambda: ok(svc.weof(drive, body.count), code="WEOF_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -443,6 +458,7 @@ def drive_wset(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-wset",
                          lambda: ok(svc.wset(drive, body.count), code="WSET_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -453,6 +469,7 @@ def drive_eof(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-eof",
                          lambda: ok(svc.eof(drive, body.count), code="EOF_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -463,6 +480,7 @@ def drive_position(drive: str, body: DrivePositionBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-position",
                          lambda: ok(svc.position(drive, body.operation, body.count), code="POSITION_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -473,6 +491,7 @@ def drive_rewind(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.rewind(drive), code="REWIND_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -482,6 +501,7 @@ def drive_offline(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.offline(drive), code="OFFLINE_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -491,6 +511,7 @@ def drive_rewoffl(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.rewoffl(drive), code="REWOFFL_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -500,6 +521,7 @@ def drive_eject(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.eject(drive), code="EJECT_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -509,6 +531,7 @@ def drive_retension(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-retension",
                          lambda: ok(svc.retension(drive), code="RETENSION_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -519,6 +542,7 @@ def drive_eod(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-eod",
                          lambda: ok(svc.eod(drive), code="EOD_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -529,6 +553,7 @@ def drive_seod(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-seod",
                          lambda: ok(svc.seod(drive), code="SEOD_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -539,6 +564,7 @@ def drive_seek(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-seek",
                          lambda: ok(svc.seek(drive, body.count), code="SEEK_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -570,6 +596,7 @@ def drive_erase(drive: str, body: DriveCountBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_3")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return submit_or_run(request, "drive-erase",
                          lambda: ok(svc.erase(drive, body.count), code="ERASE_SUCCESS",
                                     request_id=request.state.request_id), devices=(drive,))
@@ -580,6 +607,7 @@ def drive_lock(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.lock(drive), code="LOCK_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -589,6 +617,7 @@ def drive_unlock(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.unlock(drive), code="UNLOCK_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -598,6 +627,7 @@ def drive_load(drive: str, body: ConfirmBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.load(drive), code="LOAD_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -607,6 +637,7 @@ def drive_compression_set(drive: str, body: DriveCompressionBody, request: Reque
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.compression_set(drive, body.enable), code="COMPRESSION_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -616,6 +647,7 @@ def drive_block_size(drive: str, body: DriveBlockSizeBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.setblk(drive, body.block_size), code="SETBLK_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -625,6 +657,7 @@ def drive_density(drive: str, body: DriveDensityBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.setdensity(drive, body.density), code="SETDENSITY_SUCCESS",
                              request_id=request.state.request_id))
 
@@ -633,6 +666,7 @@ def drive_density(drive: str, body: DriveDensityBody, request: Request):
 def drive_partition(drive: str, body: DrivePartitionBody, request: Request):
     from app.security.policy import require_level
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     if body.partition is not None:
         # setpartition: 切换到指定分区
         require_level("LEVEL_2")
@@ -650,6 +684,7 @@ def drive_partition_seek(drive: str, body: DrivePartSeekBody, request: Request):
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, DriveService)
+    _require_confirm(body.confirm)
     return handle(lambda: ok(svc.partseek(drive, body.partition, body.block), code="PARTSEEK_SUCCESS",
                              request_id=request.state.request_id))
 

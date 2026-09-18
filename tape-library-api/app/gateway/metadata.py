@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS file_meta (
     state       TEXT NOT NULL DEFAULT 'cached' CHECK (state IN ('cached','archiving','archived','failed')),
     storage     TEXT NOT NULL DEFAULT 'cache' CHECK (storage IN ('cache','container','tape')),
     cache_path  TEXT,
+    cache_rel_path TEXT,
+    member_path TEXT,
     file_offset_in_container BIGINT,
     container_id UUID,
     media_barcode  TEXT,
@@ -138,8 +140,17 @@ CREATE INDEX IF NOT EXISTS idx_container_flush_due ON container_meta (state, fir
 CREATE INDEX IF NOT EXISTS idx_block_object ON gw_block (media_barcode, object_id);
 CREATE INDEX IF NOT EXISTS idx_block_media ON gw_block (media_barcode, block_index);
 CREATE INDEX IF NOT EXISTS idx_cache_lru ON cache_entry (last_access_at) WHERE dirty = false;
+CREATE INDEX IF NOT EXISTS idx_cache_object ON cache_entry (object_id, kind);
+CREATE INDEX IF NOT EXISTS idx_file_member_path ON file_meta (member_path) WHERE member_path IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_task_queue ON gw_task (kind, state, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_recall_heat ON recall_events (container_id, ts);
+"""
+
+# online migration for pre-directory-tree deployments: add new columns to
+# an already-created partitioned file_meta (cascades to every partition).
+MIGRATION_SQL = """
+ALTER TABLE file_meta ADD COLUMN IF NOT EXISTS cache_rel_path TEXT;
+ALTER TABLE file_meta ADD COLUMN IF NOT EXISTS member_path TEXT;
 """
 
 
@@ -171,6 +182,7 @@ class MetadataDB:
         with self.conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA_SQL)
+                cur.execute(MIGRATION_SQL)   # add new columns before indexing them
                 cur.execute(INDEXES_SQL)
                 cur.execute("SELECT inhrelid::regclass FROM pg_inherits "
                             "WHERE inhparent = 'file_meta'::regclass")
@@ -235,7 +247,8 @@ class MetadataDB:
 
     # ---------- files ----------
     def insert_file(self, filename, size_bytes, sha256=None, content_type=None,
-                    origin=None, kind="file", storage="cache", cache_path=None):
+                    origin=None, kind="file", storage="cache", cache_path=None,
+                    cache_rel_path=None, member_path=None):
         fid = new_id()
         now = _now()
         with self.conn() as conn:
@@ -243,10 +256,11 @@ class MetadataDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO file_meta (file_id, filename, size_bytes, sha256,
-                       content_type, origin, kind, state, storage, cache_path, created_at, last_access_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,'cached',%s,%s,%s,%s)""",
+                       content_type, origin, kind, state, storage, cache_path,
+                       cache_rel_path, member_path, created_at, last_access_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,'cached',%s,%s,%s,%s,%s,%s)""",
                     (fid, filename, size_bytes, sha256, content_type, origin, kind,
-                     storage, cache_path, now, now))
+                     storage, cache_path, cache_rel_path, member_path, now, now))
         return fid
 
     def get_file(self, file_id):
@@ -261,7 +275,8 @@ class MetadataDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("SELECT file_id, filename, size_bytes, sha256, state, storage, kind,"
                             " container_id, file_offset_in_container, media_barcode,"
-                            " tape_block_index, cache_path, error, created_at, archived_at"
+                            " tape_block_index, cache_path, cache_rel_path, member_path,"
+                            " error, created_at, archived_at"
                             " FROM file_meta "
                             "WHERE filename ILIKE %s ORDER BY created_at DESC LIMIT %s",
                             ("%" + name_like + "%", limit))
@@ -575,10 +590,26 @@ class MetadataDB:
                 cur.execute("SELECT * FROM cache_entry WHERE cache_key=%s", (cache_key,))
                 return cur.fetchone()
 
+    def cache_get_by_object(self, object_id, kind):
+        """Directory-tree addressing: find the cache entry by object identity
+        (cache_key is now just a bookkeeping record of the rel path)."""
+        with self.conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM cache_entry WHERE object_id=%s AND kind=%s "
+                            "ORDER BY created_at DESC LIMIT 1",
+                            (_uuid(object_id), kind))
+                return cur.fetchone()
+
     def cache_all_keys(self):
         with self.conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT cache_key FROM cache_entry")
+                return {r[0] for r in cur.fetchall()}
+
+    def cache_all_paths(self):
+        with self.conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT path FROM cache_entry")
                 return {r[0] for r in cur.fetchall()}
 
     def cache_mark_clean(self, cache_key):
@@ -586,6 +617,13 @@ class MetadataDB:
             with conn.cursor() as cur:
                 cur.execute("UPDATE cache_entry SET dirty=false, last_access_at=now() "
                             "WHERE cache_key=%s", (cache_key,))
+
+    def cache_mark_clean_by_object(self, object_id, kind):
+        """Mark all cache copies of an object clean (tape write committed)."""
+        with self.conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cache_entry SET dirty=false, last_access_at=now() "
+                            "WHERE object_id=%s AND kind=%s", (_uuid(object_id), kind))
 
     def cache_touch(self, cache_keys):
         with self.conn() as conn:
@@ -603,6 +641,41 @@ class MetadataDB:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM cache_entry WHERE cache_key = ANY(%s)",
                             (list(cache_keys),))
+
+    def cache_delete_by_path(self, path):
+        with self.conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM cache_entry WHERE path=%s", (path,))
+
+    def cache_delete_by_object(self, object_id, kind, only_path=None):
+        """Drop cache entries for an object; optionally keep entries that point
+        at a different (e.g. recalled clean) copy on disk."""
+        with self.conn() as conn:
+            with conn.cursor() as cur:
+                q = "DELETE FROM cache_entry WHERE object_id=%s AND kind=%s"
+                args = [_uuid(object_id), kind]
+                if only_path is not None:
+                    q += " AND path=%s"
+                    args.append(only_path)
+                cur.execute(q, args)
+
+    def backfill_rel_paths(self, cache_dir):
+        """One-shot (idempotent) migration: derive cache_rel_path for legacy rows."""
+        with self.conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE file_meta SET cache_rel_path = substr(cache_path, %s) "
+                    "WHERE cache_rel_path IS NULL AND cache_path IS NOT NULL "
+                    "AND cache_path LIKE %s",
+                    (len(cache_dir.rstrip('/')) + 2, cache_dir.rstrip('/') + '/%'))
+                return cur.rowcount
+
+    def files_set_member_paths(self, conn, pairs):
+        """Persist flush-time member renames (duplicate-name dedup in container)."""
+        with conn.cursor() as cur:
+            for fid, member_path in pairs:
+                cur.execute("UPDATE file_meta SET member_path=%s WHERE file_id=%s",
+                            (member_path, _uuid(fid)))
 
     def cache_lru_candidates(self, total_bytes, dirty=False):
         with self.conn() as conn:
@@ -659,8 +732,9 @@ class MetadataDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "SELECT file_id, filename, size_bytes, sha256, kind, state, storage, "
-                    "cache_path, file_offset_in_container, container_id, media_barcode, "
-                    "tape_block_index, error, created_at, archived_at, last_access_at "
+                    "cache_path, cache_rel_path, member_path, file_offset_in_container, "
+                    "container_id, media_barcode, tape_block_index, error, created_at, "
+                    "archived_at, last_access_at "
                     "FROM file_meta ORDER BY created_at DESC LIMIT %s", (file_limit,))
                 files = cur.fetchall()
                 cur.execute(

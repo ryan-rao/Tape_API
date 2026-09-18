@@ -1,5 +1,4 @@
 """Archive gateway HTTP API, mounted under /api/v1/archive."""
-import hashlib
 import os
 import uuid
 
@@ -140,13 +139,32 @@ def gw_evict(request: Request):
 
 # ---------- files ----------
 @router.post("/upload")
-async def gw_upload(request: Request, file: UploadFile = File(...)):
+async def gw_upload(request: Request, file: UploadFile = File(...),
+                    dir: str = Query(None, max_length=512,
+                                     description="cache subdirectory (absolute path "
+                                                "inside cache_dir, or relative)")):
+    """Upload a file. Optional dir= places the cached copy under a user
+    directory tree inside the cache root (name kept as-is, conflicts get a
+    fid8 suffix); without it the legacy flat upload/ layout applies."""
+    import hashlib
     require_level("LEVEL_2")
     gw = _gw(request)
     try:
+        user_dir = gw.validate_user_dir(dir)
         safe = os.path.basename(file.filename or "unnamed")[:255] or "unnamed"
-        stored = "%s_%s" % (uuid.uuid4().hex[:12], safe)
-        dest = os.path.join(gw.cfg.cache_dir, "upload", stored)
+        tag = uuid.uuid4().hex[:8]
+        if user_dir:
+            dest_dir = gw.user_dir_abs(user_dir)
+            os.makedirs(dest_dir, exist_ok=True)
+            stored = safe
+            dest = os.path.join(dest_dir, stored)
+            if os.path.exists(dest):  # name conflict: keep original, add tag
+                stem, ext = os.path.splitext(stored)
+                stored = "%s.%s%s" % (stem, tag, ext)
+                dest = os.path.join(dest_dir, stored)
+        else:
+            stored = "%s_%s" % (uuid.uuid4().hex[:12], safe)
+            dest = os.path.join(gw.cfg.cache_dir, "upload", stored)
         h = hashlib.sha256()
         size = 0
         with open(dest, "wb") as out:
@@ -158,7 +176,8 @@ async def gw_upload(request: Request, file: UploadFile = File(...)):
                 h.update(chunk)
                 size += len(chunk)
         res = gw.upload(dest, safe, size, sha256=h.hexdigest(),
-                        content_type=file.content_type, origin="api")
+                        content_type=file.content_type, origin="api",
+                        user_dir=user_dir)
         code = "TAPE_ARCHIVE_QUEUED" if res["route"] == "tape" else "CONTAINER_BUFFERED"
         return ok(res, code=code, request_id=request.state.request_id)
     except GatewayError as e:
@@ -209,17 +228,19 @@ def gw_file_get(request: Request, file_id: str):
 
 
 @router.get("/files/{file_id}/download")
-def gw_download(request: Request, file_id: str, full_container: bool = False):
+def gw_download(request: Request, file_id: str, full_container: bool = False,
+                dir: str = Query(None, max_length=512,
+                                 description="recall destination dir inside cache_dir")):
     require_level("LEVEL_1")
     gw = _gw(request)
-    recall_dir = os.path.join(gw.cfg.cache_dir, "recall")
     try:
+        dest_dir = gw.recall_dest_dir(dir) if dir else None
         res = gw.resolve(file_id)
     except GatewayError as e:
         raise _http(e)
     if res["hit"] in ("cache", "container_cache"):
         try:
-            path = gw.download(file_id, recall_dir,
+            path = gw.download(file_id, dest_dir,
                                force_full_container=full_container)
             return FileResponse(path, filename=os.path.basename(path),
                                 media_type="application/octet-stream")
@@ -230,7 +251,7 @@ def gw_download(request: Request, file_id: str, full_container: bool = False):
     # result carries the local path -- re-GET streams it from cache.
     def target():
         try:
-            path = gw.recall_direct(file_id, recall_dir,
+            path = gw.recall_direct(file_id, dest_dir,
                                    force_full_container=full_container)
             return ok({"file_id": file_id, "path": path,
                        "hint": "recall complete; GET download again to stream"},
@@ -271,15 +292,12 @@ def gw_file_archive(request: Request, file_id: str):
             return ok({"file_id": file_id, "route": "container", "container_id": cid,
                        "state": "flush-due"}, code="CONTAINER_SEALED",
                       request_id=request.state.request_id)
-        cache_key = ("upload/%s" % os.path.basename(f["cache_path"])
-                     if f.get("cache_path") else None)
         t = gw.db.task_find_active("archive_file", file_id=file_id)
         if t:
             return ok({"file_id": file_id, "route": "tape", "state": t["state"],
                        "task_id": t["task_id"]}, code="ARCHIVE_ALREADY_QUEUED",
                       request_id=request.state.request_id)
-        tid = gw.db.task_create("archive_file",
-                                {"file_id": f["file_id"], "cache_key": cache_key},
+        tid = gw.db.task_create("archive_file", {"file_id": f["file_id"]},
                                 file_id=f["file_id"])
         if f["state"] == "failed":
             with gw.db.conn() as conn:
@@ -294,18 +312,21 @@ def gw_file_archive(request: Request, file_id: str):
 
 
 @router.post("/files/{file_id}/recall")
-def gw_file_recall(request: Request, file_id: str):
-    """Recall file data from tape into the local cache (async job on cold path)."""
+def gw_file_recall(request: Request, file_id: str,
+                   dir: str = Query(None, max_length=512)):
+    """Recall file data from tape into the local cache (async job on cold path).
+    Optional dir= selects the recall destination inside cache_dir; default
+    restores the file under its original directory-tree path when known."""
     require_level("LEVEL_2")
     gw = _gw(request)
-    recall_dir = os.path.join(gw.cfg.cache_dir, "recall")
     try:
+        dest_dir = gw.recall_dest_dir(dir) if dir else None
         res = gw.resolve(file_id)
     except GatewayError as e:
         raise _http(e)
     if res["hit"] in ("cache", "container_cache"):
         try:
-            path = gw.download(file_id, recall_dir)
+            path = gw.download(file_id, dest_dir)
             return ok({"file_id": file_id, "state": "cached_local", "path": path},
                       code="RECALL_HIT", request_id=request.state.request_id)
         except GatewayError as e:
@@ -313,7 +334,7 @@ def gw_file_recall(request: Request, file_id: str):
 
     def target():
         try:
-            path = gw.recall_direct(file_id, recall_dir)
+            path = gw.recall_direct(file_id, dest_dir)
             return ok({"file_id": file_id, "path": path,
                        "hint": "recall complete; data now on disk"},
                       code="RECALLED", request_id=request.state.request_id)
@@ -333,24 +354,26 @@ def gw_cache(request: Request, kind: str = None, dirty: bool = None,
     try:
         st = gw.stats()
         rows = gw.db.cache_list(kind=kind, dirty=dirty, limit=limit, offset=offset)
-        dirs = []
-        for sub in ("upload", "containers", "recall"):
-            d = os.path.join(gw.cfg.cache_dir, sub)
+        # per-directory usage over the whole cache tree (any depth)
+        dirs = {}
+        for root, _d, files in os.walk(gw.cfg.cache_dir):
+            rel = os.path.relpath(root, gw.cfg.cache_dir)
             used = 0
-            try:
-                for fn in os.listdir(d):
-                    try:
-                        used += os.path.getsize(os.path.join(d, fn))
-                    except OSError:
-                        pass
-            except OSError:
-                pass
-            dirs.append({"dir": sub, "path": d, "used_bytes": used})
+            for fn in files:
+                try:
+                    used += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+            if used or rel != ".":
+                dirs[rel.replace(os.sep, "/")] = used
+        dir_items = [{"dir": d, "path": os.path.join(gw.cfg.cache_dir, d),
+                      "used_bytes": v}
+                     for d, v in sorted(dirs.items()) if d != "."]
         return ok({"stats": st["cache"], "config": {"cache_dir": gw.cfg.cache_dir,
                    "quota_bytes": gw.cfg.cache_quota_bytes,
                    "watermarks_pct": [gw.cfg.low_watermark_pct,
                                        gw.cfg.high_watermark_pct]},
-                   "dirs": dirs, "count": len(rows),
+                   "dirs": dir_items, "count": len(rows),
                    "items": [dict(r) for r in rows]},
                   request_id=request.state.request_id)
     except GatewayError as e:
@@ -371,6 +394,7 @@ def gw_tree(request: Request):
     try:
         files, containers, blocks, media, recalls = gw.db.tree_index()
         by_cache_path = {f["cache_path"]: f for f in files if f.get("cache_path")}
+        by_rel_path = {f["cache_rel_path"]: f for f in files if f.get("cache_rel_path")}
         by_id = {str(f["file_id"]): f for f in files}
         c_by_id = {str(c["container_id"]): c for c in containers}
         blocks_by_obj = {}
@@ -382,7 +406,7 @@ def gw_tree(request: Request):
 
         def meta_for_file(fname, rel_path, size):
             """Correlate an on-disk entry with metadata; safe-miss -> None."""
-            row = by_cache_path.get(rel_path)
+            row = by_rel_path.get(rel_path) or by_cache_path.get(rel_path)
             if row is None:
                 # containers/<uuid>.tar / recall/<name> matches
                 import re as _re
@@ -459,36 +483,77 @@ def gw_tree(request: Request):
                 "mount_count": bc.get("mount_count"),
             }
 
-        tree = {"name": os.path.basename(gw.cfg.cache_dir) or "archive-cache",
+        root = {"name": os.path.basename(gw.cfg.cache_dir) or "archive-cache",
                 "path": gw.cfg.cache_dir, "type": "dir", "size_bytes": 0,
                 "children": []}
+        dir_nodes = {"": root}
+
+        def dir_node(rel):
+            """Get-or-create a nested directory node by '/'-separated rel path."""
+            if rel in dir_nodes:
+                return dir_nodes[rel]
+            parent_rel, _, name = rel.rpartition("/")
+            parent = dir_node(parent_rel)
+            node = {"name": name, "path": os.path.join(gw.cfg.cache_dir, rel),
+                    "type": "dir", "size_bytes": 0, "children": []}
+            parent["children"].append(node)
+            dir_nodes[rel] = node
+            return node
+
+        present = set()
         total_files = 0
         orphans = 0
-        for sub in ("upload", "containers", "recall"):
-            dpath = os.path.join(gw.cfg.cache_dir, sub)
-            node = {"name": sub, "path": dpath, "type": "dir", "size_bytes": 0,
-                    "children": []}
-            try:
-                for fn in sorted(os.listdir(dpath)):
-                    fp = os.path.join(dpath, fn)
-                    try:
-                        sz = os.path.getsize(fp)
-                    except OSError:
-                        continue
-                    rel = "%s/%s" % (sub, fn)
-                    meta = meta_for_file(fn, rel, sz)
-                    if meta is None:
-                        orphans += 1
-                    node["children"].append({
-                        "name": fn, "path": fp, "type": "file", "size_bytes": sz,
-                        "meta": meta})
-                    node["size_bytes"] += sz
-                    total_files += 1
-                tree["children"].append(node)
-                tree["size_bytes"] += node["size_bytes"]
-            except OSError:
+        for cur_dir, _subs, fnames in os.walk(gw.cfg.cache_dir):
+            rel_dir = os.path.relpath(cur_dir, gw.cfg.cache_dir)
+            rel_dir = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+            node = dir_node(rel_dir)
+            for fn in sorted(fnames):
+                fp = os.path.join(cur_dir, fn)
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    continue
+                present.add(fp)
+                rel = "%s/%s" % (rel_dir, fn) if rel_dir else fn
+                meta = meta_for_file(fn, rel, sz)
+                if meta is None:
+                    orphans += 1
+                node["children"].append({
+                    "name": fn, "path": fp, "type": "file", "size_bytes": sz,
+                    "meta": meta})
+                node["size_bytes"] += sz
+                total_files += 1
+
+        # virtual nodes: sealed members whose bytes now live inside a
+        # container tar / on tape still appear under their member_path
+        virtual_count = 0
+        seen_virt = set()
+        for f in files:
+            mp = f.get("member_path")
+            if not mp or mp in seen_virt:
                 continue
-        return ok({"root": tree, "file_count": total_files,
+            if f.get("cache_path") and f["cache_path"] in present:
+                continue  # physical copy already listed
+            seen_virt.add(mp)
+            drel, _, name = mp.rpartition("/")
+            vnode = dir_node(drel)
+            vnode["children"].append({
+                "name": name, "path": os.path.join(gw.cfg.cache_dir, mp),
+                "type": "member", "size_bytes": f["size_bytes"],
+                "meta": {"type": "file", "file": _f_view(f, c_by_id, blocks_by_obj,
+                                                         media_by_bc, recall_by_fid)}})
+            virtual_count += 1
+
+        def _roll(n):
+            if n["type"] != "dir":
+                return n["size_bytes"] if n["type"] == "file" else 0
+            n["size_bytes"] = sum(_roll(c) for c in n["children"])
+            n["children"].sort(key=lambda c: (c["type"] != "dir", c["name"]))
+            return n["size_bytes"]
+        _roll(root)
+
+        return ok({"root": root, "file_count": total_files,
+                   "virtual_count": virtual_count,
                    "unmatched": orphans,
                    "meta_counts": {"files": len(files), "containers": len(containers),
                                    "blocks": len(blocks), "media": len(media)}},

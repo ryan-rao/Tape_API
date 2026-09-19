@@ -1,7 +1,7 @@
 """Services: orchestrate adapters + runner + audit. All business logic lives here."""
 import re
 
-from app.commands.adapters import LsscsiAdapter, SgAdapter, MtxAdapter, MtAdapter
+from app.commands.adapters import (LsscsiAdapter, SgAdapter, MtxAdapter, MtAdapter, SgAttrAdapter)
 from app.commands.runner import CommandRunner
 from app.audit.audit import AuditChain
 
@@ -250,11 +250,140 @@ class LibraryService(BaseService):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.mtx = MtxAdapter()
+        self.mt = MtAdapter()
+        self.attr = SgAttrAdapter()
 
     def _lock(self, changer):
         if not self.runner.locks.acquire(changer):
             raise ServiceError("DEVICE_BUSY", "device %s is busy" % changer)
         return True
+
+    # ---------- 位置参数解析（磁带 barcode/S003 · 带机 nst/sg/DTE/Drive-NN） ----------
+    @staticmethod
+    def _after_robot_move():
+        """机器人动作后清掉 inventory 服务的 20s 缓存，避免 GUI 读到旧状态。"""
+        try:
+            from app.services.inventory import cache_clear
+            cache_clear()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _env_drive_map():
+        """GATEWAY_DTE_MAP {"2":"/dev/nst1"} 反转为 nst→DTE（硬件级硬映射）。"""
+        import json
+        import os
+        try:
+            raw = json.loads(os.getenv("GATEWAY_DTE_MAP", "{}"))
+        except ValueError:
+            raw = {}
+        out = {}
+        for dte, dev in raw.items():
+            d = re.sub(r"^/dev/", "", str(dev)).lower()
+            if d.startswith("st") and not d.startswith("nst"):
+                d = "nst" + d[2:]
+            try:
+                out[d] = int(dte)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _tape_devices(self):
+        disc = DiscoveryService(self.runner, self.chain, self.request_id)
+        try:
+            devices = disc.discover()["devices"]
+        except Exception:
+            return []
+        return [d for d in devices if d.get("device_type") == "TAPE"]
+
+    def _drive_barcode(self, nst):
+        """带机内当前磁带条码（mt + MAM）；空带/探测失败返回 None。"""
+        from app.commands import parsers
+        if not nst:
+            return None
+        try:
+            rec = self.exec(self.mt.status(nst), "DRIVE_STATUS", "LEVEL_1", device=nst, timeout=20)
+        except Exception:
+            return None
+        p = parsers.parse_mt_status(rec["stdout"])
+        if not p.get("tape_online") or p.get("file_number") is None or p["file_number"] < 0:
+            return None
+        try:
+            rec2 = self.exec(self.attr.attributes(nst), "MAM", "LEVEL_1", device=nst, timeout=20)
+        except Exception:
+            return None
+        m = re.search(r"^\s*Barcode:\s*(\S+)", rec2["stdout"], re.M)
+        return m.group(1) if m else None
+
+    def _resolve_drive_ref(self, ref, status):
+        """带机位置参数 → (mtx DTE 号, 解析方法, 备注)。
+        支持：nst1 / st1 / sg2 / DTE2 / dte:2 / Drive-02(1基,lsscsi序) / 33:0:2:0。"""
+        s = str(ref).strip()
+        if re.fullmatch(r"\d+", s):
+            return int(s), "raw_element", None
+        low = re.sub(r"^/dev/", "", s).lower().replace(" ", "")
+        m = re.fullmatch(r"(?:dte|element)[-_:]?(\d+)", low)
+        if m:
+            return int(m.group(1)), "dte_label", None
+        tapes = self._tape_devices()
+        nst = None
+        m = re.fullmatch(r"drive[-_:]?0*(\d+)", low)
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(tapes):
+                nst = (tapes[idx].get("nst_device") or "").replace("/dev/", "")
+        elif re.fullmatch(r"nst\d+", low):
+            nst = low
+        elif re.fullmatch(r"st\d+", low):
+            nst = "nst" + low[2:]
+        elif re.fullmatch(r"sg\d+", low):
+            for d in tapes:
+                if (d.get("sg_device") or "").replace("/dev/", "") == low:
+                    nst = (d.get("nst_device") or "").replace("/dev/", "")
+                    break
+        elif re.fullmatch(r"\d+:\d+:\d+:\d+", low):
+            for d in tapes:
+                if d.get("scsi_address") == low:
+                    nst = (d.get("nst_device") or "").replace("/dev/", "")
+                    break
+        if not nst:
+            raise ServiceError("DRIVE_NOT_FOUND",
+                               "无法解释带机位置参数: %s（支持 nst*/st*/sg*/DTE<n>/Drive-<n>/SCSI地址/mtx元素号）" % ref)
+        em = self._env_drive_map()
+        if nst in em:
+            return em[nst], "env_map", None
+        bc = self._drive_barcode(nst)
+        if bc:
+            hits = [x for x in status.get("drives", []) if x.get("occupied") and x.get("barcode") == bc]
+            if len(hits) == 1:
+                return hits[0]["drive"], "barcode_match", "按带机内磁带 %s 匹配 /dev/%s ↔ DTE%d" % (bc, nst, hits[0]["drive"])
+        empties = [x for x in status.get("drives", []) if not x.get("occupied")]
+        if bc is None and len(empties) == 1:
+            return empties[0]["drive"], "single_empty_dte", (
+                "/dev/%s 空带且无硬映射（GATEWAY_DTE_MAP 未覆盖且无在机条码可比对），"
+                "按带库唯一空闲 DTE%d 推定；建议配置 GATEWAY_DTE_MAP" % (nst, empties[0]["drive"]))
+        raise ServiceError("DRIVE_NOT_FOUND",
+                           "带机 /dev/%s 无法映射到带库 DTE：请配置 GATEWAY_DTE_MAP 或直接使用 DTE<n>/mtx 元素号" % nst)
+
+    @staticmethod
+    def _parse_tape_position(pos):
+        """磁带位置参数 → ('slot', N) | ('dte', N)。支持 S003 / s3 / slot:3 / 纯数字 / DTE2。"""
+        s = str(pos).strip().lower().replace(" ", "")
+        m = re.fullmatch(r"s(?:lot)?[-_:]?0*(\d+)", s) or re.fullmatch(r"(\d+)", s)
+        if m:
+            return "slot", int(m.group(1))
+        m = re.fullmatch(r"(?:dte|element)[-_:]?(\d+)", s)
+        if m:
+            return "dte", int(m.group(1))
+        raise ServiceError("INVALID_REQUEST",
+                           "无法解析磁带位置参数: %s（支持 S003 / slot:3 / DTE2）" % pos)
+
+    @staticmethod
+    def _find_slot(status, element):
+        for x in status.get("slots", []):
+            if x.get("element") == element:
+                return x
+        return None
 
     def inquiry(self, changer):
         from app.commands import parsers
@@ -286,48 +415,184 @@ class LibraryService(BaseService):
             self.runner.locks.release(changer_n)
 
     def _status_inventory(self, changer):
-        """执行 mtx status 并解析为结构化槽位/驱动器清单（供 load 等内部逻辑使用）"""
+        """执行 mtx status 并解析为结构化槽位/驱动器清单（供 load 等内部逻辑使用）；
+        统一走 parsers.parse_mtx_status（含 drive.source_slot / slot.import_export）"""
         from app.security.policy import normalize_device
+        from app.commands import parsers
         changer = normalize_device(changer)
         rec = self.exec(self.mtx.status(changer), "LIBRARY_STATUS", "LEVEL_1", device=changer, timeout=120)
-        slots, drives = [], []
-        for line in rec["stdout"].splitlines():
-            m = re.match(r"\s*Storage Element (\d+):(Full|Empty)\s*:?\s*VolumeTag=\s*(\S*)", line)
-            if m:
-                slots.append({"element": int(m.group(1)), "slot": int(m.group(1)),
-                              "occupied": m.group(2) == "Full", "barcode": m.group(3) or None})
-                continue
-            m = re.match(r"\s*Data Transfer Element (\d+):(Full|Empty)(.*)", line)
-            if m:
-                d = {"element": int(m.group(1)), "drive": int(m.group(1)), "occupied": m.group(2) == "Full"}
-                tag = re.search(r"VolumeTag\s*=?\s*(\S+)", m.group(3))
-                if tag:
-                    d["barcode"] = tag.group(1)
-                drives.append(d)
-        return {"library": {"changer": changer}, "slots": slots, "drives": drives,
-                "command_id": rec["command_id"]}
+        parsed = parsers.parse_mtx_status(rec["stdout"])
+        return {"library": {"changer": changer}, "slots": parsed["slots"],
+                "drives": parsed["drives"], "command_id": rec["command_id"]}
 
-    def load(self, changer, slot, drive):
+    def load(self, changer, slot=None, drive=None, barcode=None,
+             tape_position=None, drive_position=None):
+        """槽位→带机装带。位置参数优先级：
+        磁带: barcode(自动定位槽位) > tape_position(S003/slot:3) > slot(旧字段, mtx 元素号)
+        带机: drive_position(nst1/st1/sg2/DTE2/Drive-02/SCSI地址) > drive(旧字段, mtx DTE 号)
+        返回体 resolved.* 说明每个解析结果与方法。"""
+        from app.security.policy import normalize_device, validate_slot, validate_drive
         self._lock(changer)
         try:
             inv = self._status_inventory(changer)
+            # ① 目标带机
+            method, note = "raw_element", None
+            if drive_position is not None:
+                drive, method, note = self._resolve_drive_ref(drive_position, inv)
+            elif drive is None:
+                raise ServiceError("INVALID_REQUEST",
+                                   "需提供 drive（mtx 元素号）或 drive_position（nst1/DTE2/Drive-02）")
+            drive = validate_drive(int(drive))
+            # ② 磁带位置
+            src, src_method = None, None
+            if slot is not None:
+                src, src_method = validate_slot(int(slot)), "slot"
+            elif tape_position is not None:
+                kind, val = self._parse_tape_position(tape_position)
+                if kind != "slot":
+                    raise ServiceError("INVALID_REQUEST",
+                                       "load 的 tape_position 需为槽位（S003/slot:3）；跨带机取带请先 unload")
+                src, src_method = validate_slot(val), "tape_position"
+            elif barcode:
+                hit = [x for x in inv["slots"] if x.get("occupied") and x.get("barcode") == barcode]
+                if not hit:
+                    ind = [x for x in inv["drives"] if x.get("occupied") and x.get("barcode") == barcode]
+                    if ind:
+                        raise ServiceError("MEDIA_IN_DRIVE",
+                                           "磁带 %s 已在带机 DTE%d（需先 unload）" % (barcode, ind[0]["drive"]))
+                    raise ServiceError("MEDIA_NOT_FOUND", "磁带 %s 不在带库槽位中" % barcode)
+                src, src_method = validate_slot(hit[0]["element"]), "barcode_lookup"
+            else:
+                raise ServiceError("INVALID_REQUEST", "需提供 slot / tape_position / barcode 定位磁带")
+            srec = self._find_slot(inv, src)
+            if barcode and srec and srec.get("barcode") and srec["barcode"] != barcode:
+                raise ServiceError("SLOT_MEDIA_MISMATCH",
+                                   "槽位 S%03d 内是 %s 而非 %s" % (src, srec["barcode"], barcode))
+            if not barcode and srec and srec.get("barcode"):
+                barcode = srec["barcode"]
+            if not (srec and srec.get("occupied")) and src_method != "barcode_lookup":
+                raise ServiceError("SLOT_EMPTY", "槽位 S%03d 为空，无带可装" % src)
+            # ③ 目标带机占用守卫
             for d in inv["drives"]:
                 if d["drive"] == drive and d.get("barcode"):
-                    raise ServiceError("MEDIA_ALREADY_LOADED", "drive %d already has media" % drive)
-            rec = self.ensure_pass(
-                self.exec(self.mtx.load(changer, slot, drive), "LIBRARY_LOAD", "LEVEL_2", device=changer, timeout=300),
-                "COMMAND_FAILED", "mtx load failed")
-            return {"slot": slot, "drive": drive, "command_id": rec["command_id"]}
+                    raise ServiceError("MEDIA_ALREADY_LOADED",
+                                       "带机 DTE%d 已有磁带 %s，请先 unload" % (drive, d["barcode"]))
+            try:
+                rec = self.ensure_pass(
+                    self.exec(self.mtx.load(changer, src, drive), "LIBRARY_LOAD", "LEVEL_2",
+                              device=changer, timeout=300),
+                    "COMMAND_FAILED", "mtx load failed")
+                verified, warning = True, note
+            except ServiceError as e:
+                # SCSI 44/00 类假失败复核（见 2026-09-19 REQ-20260919-232621-20EC6F）：
+                # mtx 报错但机械臂实际到位时，以 status 为准记成功
+                post = self._status_inventory(changer)
+                dd = next((x for x in post["drives"] if x["drive"] == drive), None)
+                if dd and dd.get("occupied") and (not barcode or dd.get("barcode") == barcode):
+                    rec = e.command_record if isinstance(e.command_record, dict) else {"command_id": None}
+                    verified = False
+                    warning = ("mtx 报错(%s)但状态复核确认磁带已物理装载至 DTE%d — 记为 mtx_false_alarm" %
+                               (str(e.message)[:160], drive))
+                else:
+                    raise
+            self._after_robot_move()
+            return {"slot": src, "drive": drive, "barcode": barcode,
+                    "changer": normalize_device(changer),
+                    "resolved": {"tape": "S%03d" % src, "tape_method": src_method,
+                                 "drive": "DTE%d" % drive, "drive_method": method,
+                                 "drive_note": note, "mtx_command": rec.get("command"),
+                                 "verified_by_status": verified},
+                    "warning": warning, "command_id": rec.get("command_id")}
         finally:
             self.runner.locks.release(changer)
 
-    def unload(self, changer, slot, drive):
+    def unload(self, changer, slot=None, drive=None, barcode=None,
+               tape_position=None, drive_position=None):
+        """带机→槽位卸带。磁带: barcode(自动定位所在带机) > drive_position/drive(带机内磁带)；
+        目标槽: slot(旧) > tape_position(S003) > 自动(原槽 source_slot，不行则首个空槽)。"""
+        from app.security.policy import normalize_device, validate_slot, validate_drive
         self._lock(changer)
         try:
-            rec = self.ensure_pass(
-                self.exec(self.mtx.unload(changer, slot, drive), "LIBRARY_UNLOAD", "LEVEL_2", device=changer, timeout=300),
-                "COMMAND_FAILED", "mtx unload failed")
-            return {"slot": slot, "drive": drive, "command_id": rec["command_id"]}
+            inv = self._status_inventory(changer)
+            method, note = "raw_element", None
+            dte = None
+            holders = ([x for x in inv["drives"] if x.get("occupied") and barcode and x.get("barcode") == barcode]
+                       if barcode else [])
+            if holders:
+                dte, method = holders[0]["drive"], "barcode_holder"
+                note = "磁带 %s 定位于带机 DTE%d" % (barcode, dte)
+            elif drive_position is not None:
+                dte, method, note = self._resolve_drive_ref(drive_position, inv)
+            elif drive is not None:
+                dte = validate_drive(int(drive))
+            if dte is None:
+                raise ServiceError("INVALID_REQUEST",
+                                   "需提供 drive/drive_position，或 barcode（磁带在带机时）定位带机")
+            cur = next((x for x in inv["drives"] if x["drive"] == dte), None)
+            if not cur or not cur.get("occupied"):
+                raise ServiceError("DRIVE_EMPTY", "带机 DTE%d 为空，无带可卸" % dte)
+            if barcode and cur.get("barcode") and cur["barcode"] != barcode:
+                raise ServiceError("SLOT_MEDIA_MISMATCH",
+                                   "DTE%d 内是 %s 而非 %s" % (dte, cur["barcode"], barcode))
+            bc = barcode or cur.get("barcode")
+            # 目标槽：显式 slot > tape_position > 原槽 source_slot > 首个空槽
+            dest, dmethod = None, None
+            if slot is not None:
+                dest, dmethod = validate_slot(int(slot)), "slot"
+            elif tape_position is not None:
+                kind, val = self._parse_tape_position(tape_position)
+                if kind == "slot":
+                    dest, dmethod = validate_slot(val), "tape_position"
+            if dest is None and cur.get("source_slot"):
+                es = self._find_slot(inv, cur["source_slot"])
+                if es and not es.get("occupied"):
+                    dest, dmethod = cur["source_slot"], "source_slot"
+            if dest is None:
+                for x in inv["slots"]:
+                    if not x.get("occupied") and not x.get("import_export"):
+                        dest, dmethod = x["element"], "first_empty"
+                        break
+            if dest is None:
+                for x in inv["slots"]:
+                    if not x.get("occupied"):
+                        dest, dmethod = x["element"], "first_empty_ie"
+                        break
+            if dest is None:
+                raise ServiceError("NO_EMPTY_SLOT", "带库已满，无空槽可卸带")
+            if dmethod in ("slot", "tape_position"):
+                ds = self._find_slot(inv, dest)
+                if ds is None:
+                    raise ServiceError("SLOT_NOT_FOUND", "目标槽 S%03d 不存在" % dest)
+                if ds.get("occupied"):
+                    raise ServiceError("SLOT_OCCUPIED",
+                                       "目标槽 S%03d 已被 %s 占用，请换槽或不传（自动选原槽/空槽）"
+                                       % (dest, ds.get("barcode") or "他带"))
+            try:
+                rec = self.ensure_pass(
+                    self.exec(self.mtx.unload(changer, dest, dte), "LIBRARY_UNLOAD", "LEVEL_2",
+                              device=changer, timeout=300),
+                    "COMMAND_FAILED", "mtx unload failed")
+                verified, warning = True, note
+            except ServiceError as e:
+                post = self._status_inventory(changer)
+                dd = next((x for x in post["drives"] if x["drive"] == dte), None)
+                ds = self._find_slot(post, dest)
+                if ((not dd or not dd.get("occupied")) and ds and ds.get("occupied")
+                        and (not bc or ds.get("barcode") == bc)):
+                    rec = e.command_record if isinstance(e.command_record, dict) else {"command_id": None}
+                    verified = False
+                    warning = ("mtx 报错(%s)但状态复核确认磁带已落槽 S%03d 且带机已空 — 记为 mtx_false_alarm" %
+                               (str(e.message)[:160], dest))
+                else:
+                    raise
+            self._after_robot_move()
+            return {"slot": dest, "drive": dte, "barcode": bc,
+                    "changer": normalize_device(changer),
+                    "resolved": {"drive": "DTE%d" % dte, "drive_method": method,
+                                 "drive_note": note, "target": "S%03d" % dest,
+                                 "target_method": dmethod, "mtx_command": rec.get("command"),
+                                 "verified_by_status": verified},
+                    "warning": warning, "command_id": rec.get("command_id")}
         finally:
             self.runner.locks.release(changer)
 

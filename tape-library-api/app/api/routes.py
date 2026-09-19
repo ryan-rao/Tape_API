@@ -299,8 +299,11 @@ class ConfirmBody(BaseModel):
 
 
 class LoadBody(ConfirmBody):
-    slot: int
-    drive: int
+    slot: Optional[int] = Field(None, description="目标/源槽位号（mtx 元素号，旧字段）")
+    drive: Optional[int] = Field(None, description="带机 mtx DTE 元素号（旧字段）")
+    barcode: Optional[str] = Field(None, description="磁带条码：load 自动定位所在槽位；unload 自动定位所在带机")
+    tape_position: Optional[str] = Field(None, description="磁带位置：S003 / slot:3（load=取带源槽，unload=放带目标槽）")
+    drive_position: Optional[str] = Field(None, description="带机位置：nst1 / st1 / sg2 / DTE2 / Drive-02 / SCSI地址如 33:0:2:0")
 
 
 class TransferBody(ConfirmBody):
@@ -314,23 +317,31 @@ class PositionBody(ConfirmBody):
 
 @router.post("/libraries/{changer}/load", tags=["Library"])
 def library_load(changer: str, body: LoadBody, request: Request):
+    """槽位→带机装带【异步 LEVEL_2】。位置参数：磁带用 barcode 或 tape_position(S003)，带机用 drive_position(nst1/DTE2/Drive-02)；兼容旧字段 slot/drive。响应 resolved.* 回显解析结果与方法。"""
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
     _require_confirm(body.confirm)
     return submit_or_run(request, "library-load",
-                         lambda: ok(svc.load(changer, body.slot, body.drive), code="LOAD_SUCCESS",
+                         lambda: ok(svc.load(changer, slot=body.slot, drive=body.drive,
+                                             barcode=body.barcode, tape_position=body.tape_position,
+                                             drive_position=body.drive_position),
+                                    code="LOAD_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/unload", tags=["Library"])
 def library_unload(changer: str, body: LoadBody, request: Request):
+    """带机→槽位卸带【异步 LEVEL_2】。位置参数：磁带用 barcode（自动定位所在带机）或 drive_position 指定带机；目标槽用 slot/tape_position，缺省自动回原槽(source_slot)。响应 resolved.* 回显。"""
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
     _require_confirm(body.confirm)
     return submit_or_run(request, "library-unload",
-                         lambda: ok(svc.unload(changer, body.slot, body.drive), code="UNLOAD_SUCCESS",
+                         lambda: ok(svc.unload(changer, slot=body.slot, drive=body.drive,
+                                               barcode=body.barcode, tape_position=body.tape_position,
+                                               drive_position=body.drive_position),
+                                    code="UNLOAD_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
 
 

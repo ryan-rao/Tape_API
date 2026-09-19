@@ -403,6 +403,28 @@ def library_robot_last(changer: str, request: Request):
                                     request_id=request.state.request_id), devices=(changer,))
 
 
+# ---------- Inventory (aggregated lists for GUI) ----------
+@router.get("/drives/list", tags=["Inventory"])
+def drives_list(request: Request, refresh: bool = False):
+    """带机列表：位置（SCSI 地址 + 带库 changer/DTE/来源槽位）、序列号（sg_inq）、
+    在机磁带（mt+MAM）、温度（LOG 0x3d）、TapeAlert 环境告警位、寿命统计（LOG 0x14）。
+    湿度本机型不开放读取，恒为 null。?refresh=true 强刷掉 20s TTL 缓存。"""
+    from app.services.inventory import InventoryService
+    svc = build(request, InventoryService)
+    return handle(lambda: ok(svc.list_drives(refresh=refresh), request_id=request.state.request_id))
+
+
+@router.get("/tapes/list", tags=["Inventory"])
+def tapes_list(request: Request, refresh: bool = False):
+    """磁带列表：带号(barcode)、介质 SN（MAM，仅装载态可读）、物理位置
+    （槽位/带机/带库）+ 网关台账（容量/已用/挂载次数）合并。"""
+    from app.services.inventory import InventoryService
+    gw = getattr(request.app.state, "gateway", None)
+    svc = build(request, InventoryService)
+    return handle(lambda: ok(svc.list_tapes(db=gw.db if gw else None, refresh=refresh),
+                             request_id=request.state.request_id))
+
+
 # ---------- Drives ----------
 @router.get("/drives/{drive}/status", tags=["Drive"])
 def drive_status(drive: str, request: Request):

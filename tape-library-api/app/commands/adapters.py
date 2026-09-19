@@ -34,6 +34,12 @@ class SgAdapter:
     def inquiry(self, sg: str):
         return ["sg_inq", normalize_device(sg)]
 
+    def logs_page(self, sg: str, page: str, hex_dump: bool = False):
+        argv = ["sg_logs"]
+        if hex_dump:
+            argv.append("-H")
+        return argv + ["-p", page, normalize_device(sg)]
+
     def vpd(self, sg: str, page: str = "0x80"):
         if page not in ("0x80", "0x83"):
             raise HTTPException(status_code=400, detail={"code": "INVALID_REQUEST",
@@ -55,6 +61,12 @@ class SgAdapter:
 
     def tapealert(self, sg: str):
         return ["sg_logs", "-p", "0x2e", normalize_device(sg)]
+
+
+class SgAttrAdapter:
+    """READ ATTRIBUTE (MAM) access on a tape drive; only meaningful with media loaded."""
+    def attributes(self, nst: str):
+        return ["sg_read_attr", "--first=0x0400", normalize_device(nst)]
 
 
 class MtxAdapter:

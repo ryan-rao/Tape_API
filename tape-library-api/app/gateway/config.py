@@ -18,6 +18,8 @@ FILE_KEYS = (
     "container_flush_s", "container_max_files", "cache_quota_gb", "watermarks_pct",
     "drive", "changer", "dte_map", "auto_load", "trust_drive", "verify_write",
     "max_attempts", "redis_enabled",
+    "preferred_format", "ltfs_mount_root", "ltfs_bin_dir", "ltfs_sync_policy",
+    "ltfs_mount_timeout_s",
 )
 
 
@@ -139,6 +141,20 @@ class GatewayConfig:
         self.trust_drive = str(td or "")
         self.verify_write = _as_bool(pick("verify_write", "GATEWAY_VERIFY_WRITE", "false"))
         self.tape_timeout_s = _as_int(os.getenv("GATEWAY_TAPE_TIMEOUT_S", "3600"), 3600)
+        # dual-format backends (raw | ltfs)
+        self.preferred_format = str(pick("preferred_format", "GATEWAY_PREFERRED_FORMAT", "raw"))
+        if self.preferred_format not in ("raw", "ltfs"):
+            self.preferred_format = "raw"
+        self.ltfs_mount_root = str(pick("ltfs_mount_root", "GATEWAY_LTFS_MOUNT_ROOT",
+                                        "/home/tape_api/ltfs"))
+        self.ltfs_bin_dir = str(pick("ltfs_bin_dir", "GATEWAY_LTFS_BIN_DIR",
+                                     "/opt/ibm/ltfssde/bin"))
+        self.ltfs_sync_policy = str(pick("ltfs_sync_policy", "GATEWAY_LTFS_SYNC_POLICY",
+                                         "unmount"))
+        if self.ltfs_sync_policy not in ("unmount", "keep_mounted"):
+            self.ltfs_sync_policy = "unmount"
+        self.ltfs_mount_timeout_s = _as_int(
+            pick("ltfs_mount_timeout_s", "GATEWAY_LTFS_MOUNT_TIMEOUT_S", 300), 300)
         # recall intelligence
         self.recall_hot_window_s = int(os.getenv("GATEWAY_RECALL_HOT_WINDOW_S", "60"))
         self.recall_hot_threshold = int(os.getenv("GATEWAY_RECALL_HOT_THRESHOLD", "3"))
@@ -178,6 +194,11 @@ class GatewayConfig:
             "verify_write": self.verify_write,
             "max_attempts": self.max_attempts,
             "redis_enabled": bool(self.redis_url),
+            "preferred_format": self.preferred_format,
+            "ltfs_mount_root": self.ltfs_mount_root,
+            "ltfs_bin_dir": self.ltfs_bin_dir,
+            "ltfs_sync_policy": self.ltfs_sync_policy,
+            "ltfs_mount_timeout_s": self.ltfs_mount_timeout_s,
             "config_file": config_file_path(),
             "file_keys": sorted(k for k in self.file_cfg if k in FILE_KEYS),
             "sources": dict(self.sources),

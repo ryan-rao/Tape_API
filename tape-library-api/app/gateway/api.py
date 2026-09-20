@@ -14,10 +14,15 @@ from app.api.routes import submit_or_run
 from .config import (FILE_KEYS, GatewayConfig, config_file_path, load_config_file,
                      save_config_file)
 from .manager import GatewayError, GatewayManager
+from .tapeio import TapeError
 
 
 def _http(e: GatewayError):
     return HTTPException(status_code=e.status, detail={"code": e.code, "message": e.message})
+
+
+def _tape_err(e: TapeError):
+    return HTTPException(status_code=409, detail={"code": e.code, "message": e.message})
 
 
 def _gw(request: Request):
@@ -35,6 +40,14 @@ router = APIRouter(prefix="/api/v1/archive", tags=["Archive"])
 class MediaRegister(BaseModel):
     barcode: str = Field(min_length=1, max_length=64)
     state: str = Field(default="appendable", pattern="^(unknown|scratch|appendable|full|faulted)$")
+    format: str = Field(default="raw", pattern="^(raw|ltfs)$")
+
+
+class MediaFormatBody(BaseModel):
+    """mkltfs 格式化（销毁性）：仅支持转 ltfs；raw 无需格式化。"""
+    format: str = Field(default="ltfs", pattern="^(raw|ltfs)$")
+    confirm: bool = False
+    force: bool = False
 
 
 def _tape_view(bc):
@@ -45,6 +58,7 @@ def _tape_view(bc):
     used = int(bc.get("used_bytes") or 0)
     return {
         "barcode": bc.get("barcode"), "state": bc.get("state"),
+        "format": bc.get("format") or "raw",
         "capacity_bytes": cap, "used_bytes": used,
         "free_bytes": max(cap - used, 0),
         "used_pct": round(used * 100 / cap, 1) if cap else None,
@@ -66,6 +80,7 @@ def _file_location(f, cont, in_cache):
         "media_barcode": mbc,
         "tape_block_index": f.get("tape_block_index")
                             or (cont or {}).get("tape_block_index"),
+        "ltfs_path": f.get("ltfs_path") or (cont or {}).get("ltfs_path"),
         "container_id": str(f["container_id"]) if f.get("container_id") else None,
         "offset_in_container": f.get("file_offset_in_container"),
         "download_ready": bool(in_cache),
@@ -122,6 +137,11 @@ class GwConfigBody(BaseModel):
     verify_write: bool = None
     max_attempts: int = Field(default=None, ge=1, le=10)
     redis_enabled: bool = None
+    preferred_format: str = None
+    ltfs_mount_root: str = None
+    ltfs_bin_dir: str = None
+    ltfs_sync_policy: str = None
+    ltfs_mount_timeout_s: int = Field(default=None, ge=10, le=3600)
     confirm: bool = False
     apply: bool = False  # true: 写完立即重启网关生效
 
@@ -182,6 +202,22 @@ def _validate_gw_config(values: dict) -> dict:
                 except HTTPException:
                     bad("dte_map[%s] invalid device: %s" % (kk, vv))
             out[k] = dm
+        elif k == "preferred_format":
+            if v not in ("raw", "ltfs"):
+                bad("preferred_format must be raw|ltfs")
+            out[k] = v
+        elif k == "ltfs_sync_policy":
+            if v not in ("unmount", "keep_mounted"):
+                bad("ltfs_sync_policy must be unmount|keep_mounted")
+            out[k] = v
+        elif k in ("ltfs_mount_root", "ltfs_bin_dir"):
+            if not (isinstance(v, str) and v.startswith("/")):
+                bad("%s must be an absolute path" % k)
+            out[k] = os.path.normpath(v)
+        elif k == "ltfs_mount_timeout_s":
+            if not isinstance(v, int) or isinstance(v, bool) or not (10 <= v <= 3600):
+                bad("ltfs_mount_timeout_s must be an int in 10..3600")
+            out[k] = v
         elif k == "trust_drive":
             # 空串=显式清除（自动模式），仍保留在文件层覆盖 env；非空=条码
             out[k] = "" if v in (None, "", "null") else str(v)[:64]
@@ -675,6 +711,7 @@ def gw_tree(request: Request):
         def _tape_view(bc):
             return {
                 "barcode": bc.get("barcode"), "state": bc.get("state"),
+                "format": bc.get("format") or "raw",
                 "capacity_bytes": bc.get("capacity_bytes"),
                 "used_bytes": bc.get("used_bytes"),
                 "used_pct": round(float(bc["used_bytes"]) * 100
@@ -858,9 +895,85 @@ def gw_media_register(request: Request, body: MediaRegister):
     require_level("LEVEL_2")
     gw = _gw(request)
     try:
-        gw.db.tape_upsert(body.barcode, state=body.state)
-        return ok({"barcode": body.barcode, "state": body.state}, code="MEDIA_REGISTERED",
+        gw.db.tape_upsert(body.barcode, state=body.state, format=body.format)
+        return ok({"barcode": body.barcode, "state": body.state,
+                   "format": body.format}, code="MEDIA_REGISTERED",
                   request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.post("/media/{barcode}/format",
+             summary="介质格式化（销毁性）：mkltfs 转 LTFS，抹除介质全部数据")
+def gw_media_format(request: Request, barcode: str, body: MediaFormatBody):
+    """mkltfs 将介质格式化为 LTFS——销毁性操作，抹掉介质上全部数据。
+    LEVEL_3 + confirm=true 必需；介质已有数据（gw_block 记录或 used_bytes>0）
+    时还须 force=true。执行前回读台账并复述条码。"""
+    require_level("LEVEL_3")
+    gw = _gw(request)
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_REQUEST",
+            "message": "confirm=true required (mkltfs erases the whole media)"})
+    if body.format != "ltfs":
+        return fail("UNSUPPORTED",
+                    "only formatting TO ltfs is supported; raw media needs no format "
+                    "(first write bootstraps the filemark index)",
+                    request_id=request.state.request_id)
+    try:
+        m = gw.db.tape_get(barcode)
+        if m is None:
+            return fail("MEDIA_NOT_FOUND",
+                        "barcode %s not registered; POST /archive/media first" % barcode,
+                        request_id=request.state.request_id)
+        used_blocks = next((b["blocks"] for b in gw.db.block_stats()
+                            if b["barcode"] == barcode), 0)
+        if (used_blocks > 0 or int(m.get("used_bytes") or 0) > 0) and not body.force:
+            raise HTTPException(status_code=409, detail={
+                "code": "MEDIA_NOT_EMPTY",
+                "message": "media %s carries %d block records / %d bytes; "
+                           "force=true required to erase"
+                           % (barcode, used_blocks, int(m.get("used_bytes") or 0))})
+        res = gw.tape.backends["ltfs"].format_media(barcode)
+        with gw.db.conn() as conn:
+            gw.db.tape_update(conn, barcode, state="appendable", format="ltfs",
+                              last_filemark=0)
+        return ok({"barcode": barcode, "format": "ltfs", "state": "appendable",
+                   "erased_media": barcode, "mkltfs": res["output"]},
+                  code="MEDIA_FORMATTED", request_id=request.state.request_id)
+    except TapeError as e:
+        raise _tape_err(e)
+    except GatewayError as e:
+        raise _http(e)
+
+
+# ---------- LTFS ----------
+@router.get("/ltfs/status", summary="LTFS 栈与会话健康：二进制/挂载点/租约状态")
+def gw_ltfs_status(request: Request):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        return ok(gw.tape.backends["ltfs"].status(),
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.post("/ltfs/{barcode}/check",
+             summary="对介质运行 ltfsck 一致性检查（LEVEL_2，会装载介质）")
+def gw_ltfs_check(request: Request, barcode: str):
+    require_level("LEVEL_2")
+    gw = _gw(request)
+    try:
+        m = gw.db.tape_get(barcode)
+        if m is None:
+            return fail("MEDIA_NOT_FOUND", "barcode %s not registered" % barcode,
+                        request_id=request.state.request_id)
+        res = gw.tape.backends["ltfs"].check_media(barcode)
+        return ok(res, code="LTFS_CHECK_DONE" if res["clean"] else "LTFS_CHECK_DIRTY",
+                  request_id=request.state.request_id)
+    except TapeError as e:
+        raise _tape_err(e)
     except GatewayError as e:
         raise _http(e)
 

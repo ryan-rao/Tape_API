@@ -134,6 +134,10 @@ class GatewayManager:
         except Exception:
             traceback.print_exc()
         self.tape = TapeEngine(self.runner, self.chain, self.cfg, self.db)
+        try:
+            self.tape.recover()  # clear stale LTFS sessions that outlived a restart
+        except Exception:
+            traceback.print_exc()
         self._self_heal()
         for name, target, interval in (
                 ("flusher", self._flush_loop, self.cfg.poll_interval_s),
@@ -384,7 +388,7 @@ class GatewayManager:
                 return {"hit": "container_cache", "container_path": centry["path"], "file": f}
             blk = self.db.block_lookup(cont["media_barcode"], f["container_id"]) \
                 if cont and cont.get("media_barcode") else self.db.block_lookup_any(f["container_id"])
-            if blk is None:
+            if blk is None and not (cont and cont.get("ltfs_path")):
                 return {"hit": "none", "file": f,
                         "reason": "container not yet archived and no cached copy"}
             return {"hit": "tape", "mode": "member",
@@ -569,10 +573,31 @@ class GatewayManager:
         if f["state"] == "archived":
             return {"skipped": "already archived"}
         barcode = task["payload"].get("media_barcode") or self._pick_media()
+        media = self.db.tape_get(barcode)
+        if media is None:
+            raise GatewayError("NO_MEDIA", "media %s not registered" % barcode,
+                               status=409)
+        backend = self.tape.backend_for(media)
         with self.db.conn() as conn:
             self.db.mark_files_archiving(conn, [fid])
-        block_index, written, ms = self.tape.write_block(
-            barcode, f["cache_path"], expected_bytes=f["size_bytes"])
+        if media.get("format") == "ltfs":
+            loc = backend.write_object(barcode, f["cache_path"],
+                                       expected_bytes=f["size_bytes"],
+                                       object_id=fid, object_type="file")
+            with self.db.conn() as conn:
+                self.db.tape_update(conn, barcode, used_bytes_delta=loc["bytes"],
+                                    bytes_written_delta=loc["bytes"])
+                self.db.file_set_tape_location(conn, fid, barcode, None,
+                                               ltfs_path=loc["ltfs_path"])
+                self.db.mark_files_archived(conn, [fid], "tape")
+            self.db.cache_mark_clean_by_object(fid, "file")
+            self._bump("bytes_to_tape", loc["bytes"])
+            return {"file_id": str(fid), "media": barcode, "format": "ltfs",
+                    "ltfs_path": loc["ltfs_path"], "bytes": loc["bytes"],
+                    "duration_ms": loc["duration_ms"]}
+        res = backend.write_object(barcode, f["cache_path"],
+                                   expected_bytes=f["size_bytes"])
+        block_index, written, ms = res["block_index"], res["bytes"], res["duration_ms"]
         with self.db.conn() as conn:
             self.db.block_write_records(conn, barcode, block_index, fid, "file",
                                         offset_in_block=0, length=written)
@@ -583,7 +608,8 @@ class GatewayManager:
             self.db.mark_files_archived(conn, [fid], "tape")
         self.db.cache_mark_clean_by_object(fid, "file")
         self._bump("bytes_to_tape", written)
-        return {"file_id": str(fid), "media": barcode, "block_index": block_index,
+        return {"file_id": str(fid), "media": barcode, "format": "raw",
+                "block_index": block_index,
                 "bytes": written, "duration_ms": ms}
 
     def _archive_container(self, task):
@@ -615,8 +641,34 @@ class GatewayManager:
             self.db.mark_files_archiving(conn, [f["file_id"]
                                                 for f in self.db.container_files(cid)])
         barcode = task["payload"].get("media_barcode") or self._pick_media()
-        block_index, written, ms = self.tape.write_block(
-            barcode, tar_path, expected_bytes=cont["size_bytes"])
+        media = self.db.tape_get(barcode)
+        if media is None:
+            raise GatewayError("NO_MEDIA", "media %s not registered" % barcode,
+                               status=409)
+        backend = self.tape.backend_for(media)
+        if media.get("format") == "ltfs":
+            loc = backend.write_object(barcode, tar_path,
+                                       expected_bytes=cont["size_bytes"],
+                                       object_id=cid, object_type="container")
+            with self.db.conn() as conn:
+                self.db.tape_update(conn, barcode, used_bytes_delta=loc["bytes"],
+                                    bytes_written_delta=loc["bytes"])
+                self.db.container_update(conn, cid, state="archived",
+                                         media_barcode=barcode, tape_block_index=None,
+                                         offset_in_tape=0, length_on_tape=loc["bytes"],
+                                         ltfs_path=loc["ltfs_path"], error=None,
+                                         archived_at=datetime.datetime.now(datetime.timezone.utc))
+                self.db.mark_files_archived(conn, [f["file_id"]
+                                                   for f in self.db.container_files(cid)],
+                                            "container")
+            self.db.cache_mark_clean(tar_key)
+            self._bump("bytes_to_tape", loc["bytes"])
+            return {"container_id": cid, "media": barcode, "format": "ltfs",
+                    "ltfs_path": loc["ltfs_path"], "bytes": loc["bytes"],
+                    "duration_ms": loc["duration_ms"], "files": cont["file_count"]}
+        res = backend.write_object(barcode, tar_path,
+                                   expected_bytes=cont["size_bytes"])
+        block_index, written, ms = res["block_index"], res["bytes"], res["duration_ms"]
         with self.db.conn() as conn:
             self.db.block_write_records(conn, barcode, block_index, cid, "container",
                                         offset_in_block=0, length=written)
@@ -632,20 +684,27 @@ class GatewayManager:
                                         "container")
         self.db.cache_mark_clean(tar_key)
         self._bump("bytes_to_tape", written)
-        return {"container_id": cid, "media": barcode, "block_index": block_index,
+        return {"container_id": cid, "media": barcode, "format": "raw",
+                "block_index": block_index,
                 "bytes": written, "duration_ms": ms, "files": cont["file_count"]}
 
-    def _pick_media(self):
-        """Prefer appendable media with room; else promote a scratch one."""
-        for m in self.db.tape_list():
-            if m["state"] == "appendable" and m["used_bytes"] < m["capacity_bytes"] * 0.95:
+    def _pick_media(self, fmt=None):
+        """Prefer appendable media with room; else promote a scratch one.
+        Dual-format: only media matching the preferred (or requested) format
+        qualify — never silently cross raw/ltfs boundaries."""
+        want = fmt or getattr(self.cfg, "preferred_format", "raw")
+        media = self.db.tape_list()
+        for m in media:
+            if ((m.get("format") or "raw") == want and m["state"] == "appendable"
+                    and m["used_bytes"] < m["capacity_bytes"] * 0.95):
                 return m["barcode"]
-        for m in self.db.tape_list():
-            if m["state"] == "scratch":
+        for m in media:
+            if (m.get("format") or "raw") == want and m["state"] == "scratch":
                 with self.db.conn() as conn:
                     self.db.tape_update(conn, m["barcode"], state="appendable")
                 return m["barcode"]
-        raise GatewayError("NO_MEDIA", "no appendable/scratch media registered",
+        raise GatewayError("NO_MEDIA",
+                           "no appendable/scratch media with format=%s registered" % want,
                            status=409)
 
     # ---------- recall worker ----------
@@ -692,11 +751,18 @@ class GatewayManager:
             pulled = False
             if not os.path.isfile(tar_path):
                 blk = self.db.block_lookup_any(cid)
-                if blk is None:
+                if blk is not None:
+                    self.tape.read_block(blk["media_barcode"], blk["block_index"],
+                                         cont["size_bytes"], tar_path)
+                elif cont.get("ltfs_path") and cont.get("media_barcode"):
+                    lmedia = self.db.tape_get(cont["media_barcode"])
+                    self.tape.backend_for(lmedia).read_object(
+                        cont["media_barcode"], cont["ltfs_path"], tar_path,
+                        expected_size=cont["size_bytes"])
+                else:
                     raise GatewayError("TAPE_LOCATION_MISSING",
-                                       "no block record for container %s" % cid, status=409)
-                self.tape.read_block(blk["media_barcode"], blk["block_index"],
-                                     cont["size_bytes"], tar_path)
+                                       "no block record or ltfs_path for container %s" % cid,
+                                       status=409)
                 self.db.cache_upsert("containers/%s.tar" % cid, "container", cid,
                                      tar_path, os.path.getsize(tar_path), dirty=False)
                 pulled = True
@@ -709,11 +775,18 @@ class GatewayManager:
             return {"path": final, "mode": "member", "container_pulled": pulled or None}
         # big file
         blk = self.db.block_lookup_any(fid)
-        if blk is None:
-            raise GatewayError("TAPE_LOCATION_MISSING", "no block record for %s" % fid,
-                               status=409)
         out = final + ".part"
-        self.tape.read_block(blk["media_barcode"], blk["block_index"], f["size_bytes"], out)
+        if blk is not None:
+            self.tape.read_block(blk["media_barcode"], blk["block_index"],
+                                 f["size_bytes"], out)
+        elif f.get("ltfs_path") and f.get("media_barcode"):
+            lmedia = self.db.tape_get(f["media_barcode"])
+            self.tape.backend_for(lmedia).read_object(
+                f["media_barcode"], f["ltfs_path"], out,
+                expected_size=f["size_bytes"])
+        else:
+            raise GatewayError("TAPE_LOCATION_MISSING",
+                               "no block record or ltfs_path for %s" % fid, status=409)
         os.replace(out, final)
         self._recall_done(f)
         self._remember_recalled_member(f, final)

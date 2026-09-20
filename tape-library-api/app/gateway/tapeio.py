@@ -615,7 +615,15 @@ class LtfsBackend(_CmdMixin):
                              "GW_LTFS_CHECK", "LEVEL_2", device=self._sg_dev(),
                              timeout=self._mount_timeout())
         out = (rec["stdout"] + rec["stderr"]).strip()
-        return {"barcode": barcode, "clean": rec["exit_code"] == 0,
+        # IBM ltfsck exits 1 when the volume is CONSISTENT (field-proven on
+        # 118: rc=1 + LTFS16022I); rc=8 = device open failure, 16 = usage.
+        # Judge by the verdict message, not the exit code.
+        consistent = "LTFS16022I" in out
+        inconsistent = "LTFS16021E" in out
+        clean = consistent and not inconsistent
+        verdict = "consistent" if clean else ("inconsistent" if inconsistent
+                                                  else "check-failed")
+        return {"barcode": barcode, "clean": clean, "verdict": verdict,
                 "exit_code": rec["exit_code"], "output": out[-800:]}
 
     def status(self):

@@ -339,6 +339,264 @@ class RawBlockBackend(_CmdMixin):
 
 
 # --------------------------------------------------------------------------
+# LTFS backend (format='ltfs')
+# --------------------------------------------------------------------------
+class LtfsBackend(_CmdMixin):
+    """LTFS volume backend built on the IBM ltfs binary stack (mkltfs/ltfs/
+    ltfsck, FUSE). One media per mount: <ltfs_mount_root>/<barcode>.
+
+    Session model: mount acquires the drive lease for the whole FUSE session
+    (lease.ltfs_mounted = barcode). File IO goes through the mountpoint and
+    needs no lease; raw/mtx operations are rejected with DRIVE_LEASED until
+    unmount returns the drive.
+
+    Crash-consistency: the linearization point is a successful sync+unmount
+    (LTFS flushes its index partition at unmount); PG commits only after that.
+    A crash between tape write and PG commit leaves an orphan file on the LTFS
+    volume (no dangling DB pointers); a crash mid-unmount is healed by ltfsck.
+    """
+
+    format_name = "ltfs"
+
+    def __init__(self, runner, chain, cfg, db, mounter, lease):
+        self.runner = runner
+        self.chain = chain
+        self.cfg = cfg
+        self.db = db
+        self.mounter = mounter
+        self.lease = lease
+        self.dev = normalize_device(cfg.drive)
+        self._session_lock = threading.RLock()  # serialize session transitions
+
+    # ---------- helpers ----------
+    def _bin(self, name):
+        return os.path.join(self.cfg.ltfs_bin_dir, name)
+
+    def _mp(self, barcode):
+        return os.path.join(self.cfg.ltfs_mount_root, barcode)
+
+    def _mount_timeout(self):
+        return int(getattr(self.cfg, "ltfs_mount_timeout_s", 300) or 300)
+
+    def _wait_mountstate(self, mp, want_mounted, timeout_s=None):
+        deadline = time.time() + (timeout_s or self._mount_timeout())
+        while time.time() < deadline:
+            try:
+                if os.path.ismount(mp) == want_mounted:
+                    return True
+            except OSError:
+                pass
+            time.sleep(0.5)
+        return False
+
+    @staticmethod
+    def _copy_file(src, dst):
+        """Chunked copy + fsync (works for FUSE targets)."""
+        with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+            while True:
+                chunk = f_in.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+            f_out.flush()
+            os.fsync(f_out.fileno())
+        return os.path.getsize(dst)
+
+    def capabilities(self):
+        return {"format": self.format_name, "addressing": "ltfs_path",
+                "operations": ("write_object", "read_object", "format_media",
+                               "check_media", "status")}
+
+    # ---------- session management ----------
+    def mounted(self):
+        return self.lease.ltfs_mounted
+
+    def _mount(self, barcode):
+        rid = self._open_op("ltfsmount")
+        with self.lease.exclusive("ltfs_mount"):
+            self.mounter.ensure_mounted(barcode)
+            mp = self._mp(barcode)
+            os.makedirs(mp, exist_ok=True)
+            argv = [self._bin("ltfs"), mp, "-o", "devname=" + self.dev, "-d"]
+            if self.cfg.ltfs_sync_policy == "keep_mounted":
+                # durable-enough index updates while the session stays open
+                argv[-1:] = ["-o", "sync_type=close", "-d"]
+            rec = self._exec(rid, argv, "GW_LTFS_MOUNT", "LEVEL_2",
+                             device=self.dev, timeout=self._mount_timeout())
+            self._must_pass(rec, "LTFS_MOUNT_FAILED",
+                            "ltfs mount failed: %s -> %s"
+                            % (rec["command"], (rec["stdout"] + rec["stderr"])[:300]))
+            if not self._wait_mountstate(mp, True):
+                raise TapeError("LTFS_MOUNT_TIMEOUT",
+                                "%s not mounted after %ss" % (mp, self._mount_timeout()))
+            self.lease.set_ltfs(barcode)
+            return mp
+
+    def _umount(self):
+        rid = self._open_op("ltfsumount")
+        with self.lease.exclusive("ltfs_umount"):
+            barcode = self.lease.ltfs_mounted
+            mp = self._mp(barcode) if barcode else None
+            if not mp or not os.path.ismount(mp):
+                self.lease.clear_ltfs()
+                return True
+            try:
+                os.sync()
+            except Exception:
+                pass
+            rec = self._exec(rid, ["umount", mp], "GW_LTFS_UMOUNT", "LEVEL_2",
+                             timeout=self._mount_timeout())
+            if rec["exit_code"] != 0:
+                rec = self._exec(rid, ["fusermount", "-u", mp], "GW_LTFS_UMOUNT",
+                                 "LEVEL_2", timeout=self._mount_timeout())
+            self._must_pass(rec, "LTFS_UMOUNT_FAILED",
+                            "ltfs umount failed: %s -> %s"
+                            % (rec["command"], (rec["stdout"] + rec["stderr"])[:300]))
+            if not self._wait_mountstate(mp, False):
+                raise TapeError("LTFS_UMOUNT_TIMEOUT",
+                                "%s still mounted after %ss" % (mp, self._mount_timeout()))
+            self.lease.clear_ltfs()
+            return True
+
+    def _session(self, barcode):
+        """Ensure an open LTFS session for `barcode` (one drive -> one media).
+        Returns the mountpoint."""
+        with self._session_lock:
+            cur = self.lease.ltfs_mounted
+            if cur == barcode:
+                return self._mp(barcode)
+            if cur:
+                self._umount()
+            return self._mount(barcode)
+
+    # ---------- backend interface ----------
+    def write_object(self, barcode, src_path, expected_bytes=None, object_id=None,
+                     object_type="file"):
+        """Copy src_path into the LTFS volume as objects/<type>/<id>.bin.
+        With sync_policy=unmount (default) the session is unmounted (index
+        flushed) before returning -> caller's PG commit is the safe point."""
+        if object_id is None:
+            raise TapeError("INVALID_REQUEST", "LTFS write needs object_id")
+        media = self.db.tape_get(barcode)
+        if media is None:
+            raise TapeError("MEDIA_NOT_FOUND", "barcode %s unknown to metadata" % barcode)
+        if media.get("format") != "ltfs":
+            raise TapeError("MEDIA_FORMAT_MISMATCH",
+                            "media %s format=%s, LTFS backend requires ltfs"
+                            % (barcode, media.get("format")))
+        if media["state"] not in ("appendable", "unknown", "scratch"):
+            raise TapeError("MEDIA_NOT_APPENDABLE",
+                            "media %s state=%s" % (barcode, media["state"]))
+        started = time.time()
+        mp = self._session(barcode)
+        rel = "objects/%s/%s.bin" % (object_type, object_id)
+        dest_dir = os.path.join(mp, os.path.dirname(rel))
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(mp, rel)
+        size = self._copy_file(src_path, dest)
+        if expected_bytes is not None and size != expected_bytes:
+            raise TapeError("LTFS_WRITE_SHORT",
+                            "expected %d bytes, wrote %d" % (expected_bytes, size))
+        unmounted = False
+        if self.cfg.ltfs_sync_policy == "unmount":
+            self._umount()
+            unmounted = True
+        duration_ms = int((time.time() - started) * 1000)
+        return {"ltfs_path": rel, "bytes": size, "duration_ms": duration_ms,
+                "unmounted": unmounted, "sync_policy": self.cfg.ltfs_sync_policy}
+
+    def read_object(self, barcode, ltfs_path, out_path, expected_size=None):
+        """Copy objects/<...> back from the LTFS volume; unmounts afterwards
+        to hand the drive back (reads need no index flush)."""
+        started = time.time()
+        mp = self._session(barcode)
+        src = os.path.join(mp, ltfs_path)
+        if not os.path.isfile(src):
+            raise TapeError("LTFS_FILE_NOT_FOUND",
+                            "%s not on LTFS volume %s" % (ltfs_path, barcode))
+        size = self._copy_file(src, out_path)
+        if expected_size is not None and size != expected_size:
+            raise TapeError("LTFS_READ_SHORT",
+                            "expected %d bytes, got %d" % (expected_size, size))
+        self._umount()
+        return size, int((time.time() - started) * 1000)
+
+    def format_media(self, barcode, volume_name=None):
+        """mkltfs the media (DESTRUCTIVE: erases everything on it). Caller
+        must have re-confirmed the barcode; we re-verify it exists in the
+        library and is loaded into the drive before formatting."""
+        rid = self._open_op("mkltfs")
+        with self.lease.exclusive("ltfs_mount"):
+            self.mounter.ensure_mounted(barcode)
+            argv = [self._bin("mkltfs"), "-f", "-d", self.dev,
+                    "-n", volume_name or barcode]
+            rec = self._exec(rid, argv, "GW_LTFS_FORMAT", "LEVEL_3",
+                             device=self.dev, timeout=self._mount_timeout())
+            self._must_pass(rec, "LTFS_FORMAT_FAILED",
+                            "mkltfs failed: %s -> %s"
+                            % (rec["command"], (rec["stdout"] + rec["stderr"])[:300]))
+        out = (rec["stdout"] + rec["stderr"]).strip()
+        return {"barcode": barcode, "formatted": True, "volume_name": volume_name or barcode,
+                "output": out[-600:]}
+
+    def check_media(self, barcode):
+        """Run ltfsck against the (unmounted) volume in the drive."""
+        rid = self._open_op("ltfsck")
+        with self.lease.exclusive("ltfs_mount"):
+            self.mounter.ensure_mounted(barcode)
+            rec = self._exec(rid, [self._bin("ltfsck"), "-v", self.dev],
+                             "GW_LTFS_CHECK", "LEVEL_2", device=self.dev,
+                             timeout=self._mount_timeout())
+        out = (rec["stdout"] + rec["stderr"]).strip()
+        return {"barcode": barcode, "clean": rec["exit_code"] == 0,
+                "exit_code": rec["exit_code"], "output": out[-800:]}
+
+    def status(self):
+        root = self.cfg.ltfs_mount_root
+        mounted_dirs = []
+        try:
+            for name in sorted(os.listdir(root)):
+                p = os.path.join(root, name)
+                if os.path.isdir(p) and os.path.ismount(p):
+                    mounted_dirs.append(name)
+        except OSError:
+            pass
+        return {
+            "ltfs_mounted": self.lease.ltfs_mounted,
+            "mount_root": root,
+            "bin_dir": self.cfg.ltfs_bin_dir,
+            "sync_policy": self.cfg.ltfs_sync_policy,
+            "mount_timeout_s": self._mount_timeout(),
+            "binaries": {n: os.path.isfile(self._bin(n))
+                         for n in ("ltfs", "mkltfs", "ltfsck")},
+            "mounted_dirs": mounted_dirs,
+        }
+
+    def recover_stale(self):
+        """Gateway restart hook: any LTFS session that outlived the process
+        is unmounted best-effort (in-flight writes died with the process)."""
+        recovered = []
+        root = self.cfg.ltfs_mount_root
+        try:
+            for name in sorted(os.listdir(root)):
+                p = os.path.join(root, name)
+                if os.path.isdir(p) and os.path.ismount(p):
+                    try:
+                        rec = self._exec(self._open_op("ltfsrecover"),
+                                         ["fusermount", "-u", p],
+                                         "GW_LTFS_UMOUNT", "LEVEL_2",
+                                         timeout=self._mount_timeout())
+                        if rec["exit_code"] == 0 or not os.path.ismount(p):
+                            recovered.append(name)
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+        self.lease.clear_ltfs()
+        return {"unmounted_stale": recovered}
+
+
+# --------------------------------------------------------------------------
 # engine facade
 # --------------------------------------------------------------------------
 class TapeEngine(_CmdMixin):
@@ -356,7 +614,9 @@ class TapeEngine(_CmdMixin):
         self.lease = DriveLease()
         self.mounter = MediaMounter(runner, chain, cfg, db, self.lease)
         self.backends = {"raw": RawBlockBackend(runner, chain, cfg, db,
-                                                self.mounter, self.lease)}
+                                                self.mounter, self.lease),
+                         "ltfs": LtfsBackend(runner, chain, cfg, db,
+                                             self.mounter, self.lease)}
         self._req = None
 
     # ---------- backend routing ----------

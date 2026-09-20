@@ -1,5 +1,6 @@
 """Archive gateway HTTP API, mounted under /api/v1/archive."""
 import os
+import traceback
 import uuid
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
@@ -10,7 +11,9 @@ from app.models.common import fail, ok
 from app.security.policy import require_level
 from app.api.routes import submit_or_run
 
-from .manager import GatewayError
+from .config import (FILE_KEYS, GatewayConfig, config_file_path, load_config_file,
+                     save_config_file)
+from .manager import GatewayError, GatewayManager
 
 
 def _http(e: GatewayError):
@@ -97,6 +100,205 @@ def gw_config(request: Request):
     require_level("LEVEL_1")
     gw = _gw(request)
     return ok(gw.cfg.summary(), request_id=request.state.request_id)
+
+
+# ---------- gw-config: 启动/重启网关前的参数配置（文件层 > env > 默认） ----------
+class GwConfigBody(BaseModel):
+    """字段与 GET /archive/config 的 summary 同形；只传需要改的键。"""
+    enabled: bool = None
+    cache_dir: str = None
+    db_dsn: str = None
+    small_file_mb: int = Field(default=None, ge=1, le=10240)
+    container_target_mb: int = Field(default=None, ge=1, le=102400)
+    container_flush_s: int = Field(default=None, ge=5, le=86400)
+    container_max_files: int = Field(default=None, ge=1, le=200000)
+    cache_quota_gb: int = Field(default=None, ge=1, le=102400)
+    watermarks_pct: list = None  # [low, high]
+    drive: str = None
+    changer: str = None
+    dte_map: dict = None
+    auto_load: bool = None
+    trust_drive: str = None
+    verify_write: bool = None
+    max_attempts: int = Field(default=None, ge=1, le=10)
+    redis_enabled: bool = None
+    confirm: bool = False
+    apply: bool = False  # true: 写完立即重启网关生效
+
+
+class GwApplyBody(BaseModel):
+    confirm: bool = False
+
+
+def _validate_gw_config(values: dict) -> dict:
+    """白名单+语义校验，返回清洗后的文件层键值；非法抛 GatewayError(400)。"""
+    from app.security.policy import normalize_device
+
+    def bad(msg):
+        raise GatewayError("INVALID_GW_CONFIG", msg, status=400)
+
+    out = {}
+    for k, v in values.items():
+        if k in ("confirm", "apply"):
+            continue
+        if k not in FILE_KEYS:
+            bad("unknown key: %s (allowed: %s)" % (k, ",".join(FILE_KEYS)))
+        if v is None and k not in ("trust_drive",):
+            continue
+        if k in ("enabled", "auto_load", "verify_write", "redis_enabled"):
+            out[k] = bool(v)
+        elif k == "cache_dir":
+            if not (isinstance(v, str) and v.startswith("/")):
+                bad("cache_dir must be an absolute path")
+            out[k] = os.path.normpath(v)
+        elif k == "db_dsn":
+            if not (isinstance(v, str) and (v.startswith("postgresql://") or ":" in v)):
+                bad("db_dsn must be host:port/dbname or postgresql:// DSN")
+            # 支持把 summary 脱敏后的 "host:port/db" 直接回传：补全为完整 DSN
+            out[k] = v if "://" in v else "postgresql://postgres@%s" % v
+        elif k in ("small_file_mb", "container_target_mb", "container_flush_s",
+                   "container_max_files", "cache_quota_gb", "max_attempts"):
+            if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                bad("%s must be a positive int" % k)
+            out[k] = v
+        elif k == "watermarks_pct":
+            if (not isinstance(v, (list, tuple)) or len(v) != 2
+                    or not all(isinstance(x, int) and 0 < x < 100 for x in v)
+                    or v[0] >= v[1]):
+                bad("watermarks_pct must be [low, high], 0<low<high<100")
+            out[k] = list(v)
+        elif k in ("drive", "changer"):
+            try:
+                out[k] = normalize_device(str(v))
+            except HTTPException:
+                bad("%s invalid device: %s" % (k, v))
+        elif k == "dte_map":
+            if not isinstance(v, dict):
+                bad("dte_map must be {dte_index: '/dev/nstN'}")
+            dm = {}
+            for kk, vv in v.items():
+                try:
+                    dm[str(kk)] = normalize_device(str(vv))
+                except HTTPException:
+                    bad("dte_map[%s] invalid device: %s" % (kk, vv))
+            out[k] = dm
+        elif k == "trust_drive":
+            # 空串=显式清除（自动模式），仍保留在文件层覆盖 env；非空=条码
+            out[k] = "" if v in (None, "", "null") else str(v)[:64]
+    if "small_file_mb" in out and "container_target_mb" in out \
+            and out["small_file_mb"] > out["container_target_mb"]:
+        bad("small_file_mb must be <= container_target_mb")
+    return out
+
+
+def _gateway_candidate_summary():
+    """按当前磁盘文件层+env 计算“重启后会生效”的配置预览（不落盘、不启动）。"""
+    return GatewayConfig().summary()
+
+
+@router.get("/gw-config", summary="网关配置全貌：运行值/文件层/重启后预览与 pending_diff")
+def gw_config_read(request: Request):
+    """读取网关配置全貌：当前运行值、配置文件层内容、重启后将生效值与差异项。
+    网关未运行时也可用（用于启动前预配置核对）。"""
+    require_level("LEVEL_1")
+    gw = getattr(request.app.state, "gateway", None)
+    candidate = _gateway_candidate_summary()
+    live = gw.cfg.summary() if gw else None
+    diff = []
+    if live:
+        for k, v in candidate.items():
+            if k in ("config_file", "file_keys", "sources"):
+                continue
+            if live.get(k) != v:
+                diff.append({"key": k, "live": live.get(k), "after_restart": v})
+    return ok({
+        "running": bool(gw),
+        "live": live,
+        "file_layer": load_config_file(),
+        "config_file": config_file_path(),
+        "candidate_after_restart": {k: v for k, v in candidate.items()
+                                    if k not in ("sources",)},
+        "restart_required": bool(diff),
+        "pending_diff": diff,
+    }, request_id=request.state.request_id)
+
+
+@router.post("/gw-config", summary="保存网关参数到 gateway-config.json（文件层>env；apply=true 写后立即重启生效）")
+def gw_config_write(request: Request, body: GwConfigBody):
+    """启动网关前/运行中配置网关参数：写入 gateway-config.json（文件层 > GATEWAY_* env）。
+    apply=false 仅保存，重启网关（POST /gw-config/apply 或 start-gw.sh）后生效；
+    apply=true 写后立即原地重启。LEVEL_2，confirm=true 必需。"""
+    require_level("LEVEL_2")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_REQUEST", "message": "confirm=true required for gateway config change"})
+    provided = body.model_dump(exclude_unset=True)
+    try:
+        values = _validate_gw_config(provided)
+    except GatewayError as e:
+        raise _http(e)
+    if not values:
+        raise _http(GatewayError("INVALID_GW_CONFIG", "no valid keys provided", status=400))
+    merged = save_config_file(values)
+    candidate = _gateway_candidate_summary()
+    resp = {
+        "saved": values,
+        "config_file": config_file_path(),
+        "file_layer": merged,
+        "candidate_after_restart": {k: v for k, v in candidate.items() if k not in ("sources",)},
+        "applied": False,
+        "restart_required": True,
+    }
+    if body.apply:
+        st = _restart_gateway(request.app, request.state.request_id)
+        resp["applied"] = True
+        resp["restart"] = st
+        resp["restart_required"] = not st["running"] and bool(candidate.get("enabled"))
+    return ok(resp, code="GW_CONFIG_SAVED", request_id=request.state.request_id)
+
+
+@router.post("/gw-config/apply", summary="按已存 gw-config 原地重启网关 worker（有 running job 则 409 拒绝）")
+def gw_config_apply(request: Request, body: GwApplyBody):
+    """按已保存的 gw-config 原地重启归档网关 worker（停止旧实例→重建→启动）。
+    有运行中的网关 job 时拒绝（409），除非无活跃 job。LEVEL_2 + confirm。"""
+    require_level("LEVEL_2")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_REQUEST", "message": "confirm=true required for gateway restart"})
+    st = _restart_gateway(request.app, request.state.request_id)
+    return ok(st, code="GW_RESTARTED" if st["running"] else "GW_STOPPED",
+              request_id=request.state.request_id)
+
+
+def _restart_gateway(app, request_id=""):
+    """停止当前网关实例并按磁盘配置层重建。PG 不可达时网关保持停止并回报原因。"""
+    jobs = getattr(app.state, "jobs", None)
+    if jobs is not None:
+        active = [j for j in jobs.list(status="running", limit=100)]
+        if active:
+            raise HTTPException(status_code=409, detail={
+                "code": "GW_JOBS_RUNNING",
+                "message": "gateway restart refused: %d job(s) running (%s); retry later"
+                           % (len(active), ",".join(j["job_id"] for j in active[:5]))})
+    old = getattr(app.state, "gateway", None)
+    if old is not None:
+        try:
+            old.shutdown()
+        except Exception:
+            traceback.print_exc()
+        app.state.gateway = None
+    cfg = GatewayConfig()
+    if not cfg.enabled:
+        return {"running": False, "reason": "enabled=false in gw-config; gateway stopped",
+                "config": cfg.summary()}
+    try:
+        gw = GatewayManager(cfg, runner=app.state.runner, chain=app.state.chain)
+        gw.start()
+        app.state.gateway = gw
+        return {"running": True, "reason": "gateway restarted with gw-config", "config": cfg.summary()}
+    except Exception as e:
+        return {"running": False, "reason": "gateway start failed: %s" % e,
+                "config": cfg.summary()}
 
 
 @router.get("/stats")

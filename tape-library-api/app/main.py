@@ -18,7 +18,7 @@ from app.models.common import fail
 def create_app(audit_dir=None, timeout=None, runner=None):
     app = FastAPI(
         title="Tape Library API",
-        version="1.2.1",
+        version="1.2.4",
         description="REST API for Linux Tape Library management: discovery, library/drive/media "
                     "operations, SCSI diagnostics, read/write tests, full audit trail. "
                     "Safety model: LEVEL_1 read-only, LEVEL_2 device ops, LEVEL_3 write/erase. "
@@ -52,20 +52,21 @@ def create_app(audit_dir=None, timeout=None, runner=None):
         return JSONResponse(status_code=500, content=fail("INTERNAL_ERROR", str(exc),
                                                           request_id=getattr(request.state, "request_id", "")).model_dump())
 
-    # ---- archive gateway (optional; disabled gracefully if PG unreachable) ----
+    # ---- archive gateway: config API always mounted (gw-config usable before
+    # the gateway is running); worker threads only start when enabled+PG healthy ----
     app.state.gateway = None
-    if os.getenv("GATEWAY_ENABLED", "true").lower() == "true":
-        try:
-            from app.gateway import GatewayConfig, GatewayManager
-            from app.gateway.api import router as gateway_api_router
-            gw_cfg = GatewayConfig()
+    try:
+        from app.gateway import GatewayConfig, GatewayManager
+        from app.gateway.api import router as gateway_api_router
+        app.include_router(gateway_api_router)
+        gw_cfg = GatewayConfig()
+        if gw_cfg.enabled:
             gw = GatewayManager(gw_cfg, runner=app.state.runner, chain=chain)
             gw.start()
             app.state.gateway = gw
-            app.include_router(gateway_api_router)
-        except Exception as e:  # PG down etc: keep the core API up
-            print("[gateway] startup failed, continuing without gateway:", e,
-                  file=sys.stderr)
+    except Exception as e:  # PG down etc: keep the core API up
+        print("[gateway] startup failed, continuing without gateway:", e,
+              file=sys.stderr)
 
     @app.get("/", tags=["Meta"])
     def root():

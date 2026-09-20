@@ -22,3 +22,7 @@ tape-library-api/manual-evidence3-sections.md
 nohup.out
 tape-library-api/audit/
 tape-library-api/manual-evidence*/
+
+# runtime data & code backups (server-only, never sync)
+archive-cache/
+backup-*/

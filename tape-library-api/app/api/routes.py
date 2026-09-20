@@ -299,9 +299,10 @@ class ConfirmBody(BaseModel):
 
 
 class LoadBody(ConfirmBody):
-    slot: Optional[int] = Field(None, description="目标/源槽位号（mtx 元素号，旧字段）")
+    barcode: Optional[str] = Field(None, description="【推荐】磁带条码：load 先检查磁带必须在槽位（在带机→MEDIA_IN_DRIVE，不在库→MEDIA_NOT_FOUND）；unload 先检查磁带必须在带机（在槽→MEDIA_NOT_IN_DRIVE）")
+    drive_sn: Optional[str] = Field(None, description="【推荐·load】带机序列号（GET /drives/list 的 serial，如 607B811E08）：动作前检查 SN 存在→带机可达就绪→带机为空")
+    slot: Optional[int] = Field(None, description="目标/源槽位号（mtx 元素号）：load 可替 barcode 指定源槽；unload 配合 barcode 指定目标槽（检查存在且为空）；不传则自动回原槽/首个空槽")
     drive: Optional[int] = Field(None, description="带机 mtx DTE 元素号（旧字段）")
-    barcode: Optional[str] = Field(None, description="磁带条码：load 自动定位所在槽位；unload 自动定位所在带机")
     tape_position: Optional[str] = Field(None, description="磁带位置：S003 / slot:3（load=取带源槽，unload=放带目标槽）")
     drive_position: Optional[str] = Field(None, description="带机位置：nst1 / st1 / sg2 / DTE2 / Drive-02 / SCSI地址如 33:0:2:0")
 
@@ -317,7 +318,9 @@ class PositionBody(ConfirmBody):
 
 @router.post("/libraries/{changer}/load", tags=["Library"])
 def library_load(changer: str, body: LoadBody, request: Request):
-    """槽位→带机装带【异步 LEVEL_2】。位置参数：磁带用 barcode 或 tape_position(S003)，带机用 drive_position(nst1/DTE2/Drive-02)；兼容旧字段 slot/drive。响应 resolved.* 回显解析结果与方法。"""
+    """槽位→带机装带【异步 LEVEL_2】。推荐 barcode（磁带条码）+ drive_sn（带机序列号）：
+    动作前分别检查磁带状态（必在槽位）与带机状态（存在/可达/为空）；兼容 tape_position/slot
+    与 drive_position/drive。响应 checks.* 回显前置检查，resolved.* 回显解析方法。"""
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
@@ -325,14 +328,16 @@ def library_load(changer: str, body: LoadBody, request: Request):
     return submit_or_run(request, "library-load",
                          lambda: ok(svc.load(changer, slot=body.slot, drive=body.drive,
                                              barcode=body.barcode, tape_position=body.tape_position,
-                                             drive_position=body.drive_position),
+                                             drive_position=body.drive_position, drive_sn=body.drive_sn),
                                     code="LOAD_SUCCESS",
                                     request_id=request.state.request_id), devices=(changer,))
 
 
 @router.post("/libraries/{changer}/unload", tags=["Library"])
 def library_unload(changer: str, body: LoadBody, request: Request):
-    """带机→槽位卸带【异步 LEVEL_2】。位置参数：磁带用 barcode（自动定位所在带机）或 drive_position 指定带机；目标槽用 slot/tape_position，缺省自动回原槽(source_slot)。响应 resolved.* 回显。"""
+    """带机→槽位卸带【异步 LEVEL_2】。推荐 barcode（磁带条码）+ slot（目标槽）：
+    动作前检查磁带必在带机、目标槽存在且为空；slot 缺省自动回原槽(source_slot)。
+    兼容 drive_position/drive 指定带机。响应 checks.* 回显前置检查，resolved.* 回显解析。"""
     from app.security.policy import require_level
     require_level("LEVEL_2")
     svc = build(request, LibraryService)
@@ -433,6 +438,22 @@ def tapes_list(request: Request, refresh: bool = False):
     gw = getattr(request.app.state, "gateway", None)
     svc = build(request, InventoryService)
     return handle(lambda: ok(svc.list_tapes(db=gw.db if gw else None, refresh=refresh),
+                             request_id=request.state.request_id))
+
+
+@router.get("/libraries/{changer}/slots/list", tags=["Inventory"])
+def library_slots_list(changer: str, request: Request, refresh: bool = False,
+                      occupied_only: bool = False, barcode: Optional[str] = None,
+                      limit: int = 0, offset: int = 0):
+    """槽位清单：每个槽的位置(Sxxx/mtx元素号)、占用、条码，叠加网关介质台账
+    （state/容量/已用/挂载次数）；另附 drives[] 带机快照与 summary 统计。
+    走 20s TTL 缓存；过滤 ?occupied_only=true / ?barcode=IBM006LA；分页 ?limit=&offset=。"""
+    from app.services.inventory import InventoryService
+    gw = getattr(request.app.state, "gateway", None)
+    svc = build(request, InventoryService)
+    return handle(lambda: ok(svc.list_slots(changer, db=gw.db if gw else None,
+                                            refresh=refresh, occupied_only=occupied_only,
+                                            barcode=barcode, limit=limit, offset=offset),
                              request_id=request.state.request_id))
 
 

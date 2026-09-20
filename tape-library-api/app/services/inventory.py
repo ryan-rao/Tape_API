@@ -18,7 +18,7 @@ import threading
 import time
 
 from app.commands.adapters import MtAdapter, MtxAdapter, SgAdapter, SgAttrAdapter
-from app.services.services import BaseService, DiscoveryService
+from app.services.services import BaseService, DiscoveryService, ServiceError
 
 
 _TTL = 20.0        # mtx status / environment probes: seconds
@@ -396,3 +396,73 @@ class InventoryService(BaseService):
                "bytes_written": (media or {}).get("bytes_written"),
                "registered": media is not None}
         return row
+
+    def list_slots(self, changer, db=None, refresh=False,
+                   occupied_only=False, barcode=None, limit=0, offset=0):
+        """槽位聚合清单：mtx status 的槽位位置/占用/条码，叠加归档网关
+        tape_media 台账（state/容量/已用/挂载次数）。走 20s TTL 缓存；
+        ?refresh=true 强刷。过滤：occupied_only / barcode；分页 limit/offset（0=不限）。
+        另附 drives[] 带机快照，便于交叉核对。"""
+        if refresh:
+            cache_clear()
+        from app.security.policy import normalize_device
+        ch = normalize_device(changer).replace("/dev/", "")
+        status = self._library_status(ch)
+        if status is None:
+            raise ServiceError("LIBRARY_NOT_FOUND",
+                               "无法读取 /dev/%s 的 mtx status（设备不存在或机器人忙）" % ch)
+        ledger, ledger_error = {}, None
+        if db is not None:
+            try:
+                for row in db.tape_list():
+                    ledger[row["barcode"]] = dict(row)
+            except Exception as e:
+                ledger_error = str(e)[:200]
+        else:
+            ledger_error = "gateway db not available"
+        rows, occ_cnt, ie_cnt, bc_cnt = [], 0, 0, 0
+        want_bc = (barcode or "").strip().upper() or None
+        for slot in status.get("slots", []):
+            el = slot.get("element")
+            occupied = bool(slot.get("occupied"))
+            ie = bool(slot.get("import_export"))
+            bc = slot.get("barcode")
+            if occupied:
+                occ_cnt += 1
+            if ie:
+                ie_cnt += 1
+            if bc:
+                bc_cnt += 1
+            if occupied_only and not occupied:
+                continue
+            if want_bc and (bc or "").upper() != want_bc:
+                continue
+            row = {"element": el, "position": "S%03d" % (el if el is not None else 0),
+                   "occupied": occupied, "import_export": ie, "barcode": bc}
+            if bc:
+                m = ledger.get(bc)
+                if m:
+                    row["media"] = {"registered": True, "state": m.get("state"),
+                                    "capacity_bytes": m.get("capacity_bytes"),
+                                    "used_bytes": m.get("used_bytes"),
+                                    "block_records": m.get("block_records"),
+                                    "mount_count": m.get("mount_count"),
+                                    "bytes_written": m.get("bytes_written")}
+                else:
+                    row["media"] = {"registered": False, "state": "unregistered"}
+            rows.append(row)
+        total = len(rows)
+        if offset:
+            rows = rows[offset:]
+        if limit:
+            rows = rows[:limit]
+        drives = [{"drive": d.get("drive"), "occupied": bool(d.get("occupied")),
+                   "barcode": d.get("barcode"), "source_slot": d.get("source_slot")}
+                  for d in status.get("drives", [])]
+        return {"changer": ch,
+                "summary": {"slots_total": len(status.get("slots", [])),
+                            "occupied": occ_cnt, "with_barcode": bc_cnt,
+                            "import_export": ie_cnt, "loaded_drives": sum(1 for d in drives if d["occupied"]),
+                            "returned": len(rows), "total_filtered": total},
+                "slots": rows, "drives": drives,
+                "ledger": {"source": "tape_media", "merged": bool(ledger), "error": ledger_error}}

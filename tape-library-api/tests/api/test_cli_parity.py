@@ -67,14 +67,14 @@ class TestWeof:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([(0, "", "")], None)
-        r = c.post("/api/v1/drives/nst1/weof", json={"count": 1, "confirm": True})
+        r = c.post("/api/v1/drives/nst1/weof?async=false", json={"count": 1, "confirm": True})
         assert r.json()["code"] == "WEOF_SUCCESS"
 
     def test_weof_unauthorized(self, monkeypatch):
         import app.config as cfg
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "DIAGNOSTIC")
         c = make_client([], None)
-        r = c.post("/api/v1/drives/nst1/weof", json={"count": 1, "confirm": True})
+        r = c.post("/api/v1/drives/nst1/weof?async=false", json={"count": 1, "confirm": True})
         assert r.status_code == 403
 
 
@@ -88,7 +88,7 @@ class TestWriteVerify:
                   (0, "", ""), (0, "", ""), (0, "256+0 records in\n", "268435456 bytes copied\n"),
                   (0, "", ""), (0, "CONTENT_VERIFY_OK\n", "")]
         c = make_client(script, None)
-        r = c.post("/api/v1/tests/write-verify",
+        r = c.post("/api/v1/tests/write-verify?async=false",
                    json={"drive": "/dev/nst1", "test_media": "IBM015LA", "size_mb": 256,
                          "allow_write": True, "confirm": True})
         body = r.json()
@@ -101,7 +101,7 @@ class TestWriteVerify:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([], None)
-        r = c.post("/api/v1/tests/write-verify",
+        r = c.post("/api/v1/tests/write-verify?async=false",
                    json={"drive": "/dev/nst1", "size_mb": 256, "allow_write": False, "confirm": True})
         assert r.status_code == 403
         assert r.json()["detail"]["code"] == "WRITE_OPERATION_NOT_AUTHORIZED"
@@ -111,6 +111,6 @@ class TestWriteVerify:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([], None)
-        r = c.post("/api/v1/tests/write-verify",
+        r = c.post("/api/v1/tests/write-verify?async=false",
                    json={"drive": "/dev/nst1", "size_mb": 256, "allow_write": True, "confirm": True})
         assert r.status_code == 400

@@ -170,7 +170,7 @@ class TestLibraryAPI:
 
     def test_inventory_triggers_mtx_inventory(self, monkeypatch):
         c = make_client([], monkeypatch, mode="FULL")
-        r = c.get("/api/v1/libraries/sg1/inventory")
+        r = c.get("/api/v1/libraries/sg1/inventory?async=false")
         b = r.json()
         assert r.status_code == 200, r.text
         assert b["code"] == "INVENTORY_SUCCESS"
@@ -181,27 +181,27 @@ class TestLibraryAPI:
     def test_load_success(self, monkeypatch):
         script = [(0, MTX_STATUS, ""), (0, "Loading media...done\n", "")]
         c = make_client(script, monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/load", json={"slot": 6, "drive": 0, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/load?async=false", json={"slot": 6, "drive": 0, "confirm": True})
         body = r.json()
         assert body["success"] is True and body["code"] == "LOAD_SUCCESS"
 
     def test_load_already_loaded(self, monkeypatch):
         script = [(0, MTX_STATUS, "")]  # DTE1 occupied
         c = make_client(script, monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/load", json={"slot": 6, "drive": 1, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/load?async=false", json={"slot": 6, "drive": 1, "confirm": True})
         assert r.status_code == 400
         assert r.json()["detail"]["code"] == "MEDIA_ALREADY_LOADED"
 
     def test_load_invalid_slot(self, monkeypatch):
         c = make_client([], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/load", json={"slot": -1, "drive": 0, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/load?async=false", json={"slot": -1, "drive": 0, "confirm": True})
         assert r.status_code == 400
         assert r.json()["detail"]["code"] == "INVALID_SLOT"
 
     def test_load_command_failure(self, monkeypatch):
         script = [(0, MTX_STATUS, ""), (1, "", "mtx: load failed")]
         c = make_client(script, monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/load", json={"slot": 6, "drive": 0, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/load?async=false", json={"slot": 6, "drive": 0, "confirm": True})
         assert r.status_code == 502
 
     def test_load_not_authorized_in_safe_mode(self, monkeypatch):
@@ -209,7 +209,7 @@ class TestLibraryAPI:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "SAFE")
         monkeypatch.setattr(cfg.settings, "allow_device_operation", False)
         c = make_client([], None)
-        r = c.post("/api/v1/libraries/sg1/load", json={"slot": 6, "drive": 0, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/load?async=false", json={"slot": 6, "drive": 0, "confirm": True})
         assert r.status_code == 403
 
 
@@ -228,18 +228,18 @@ class TestDriveAPI:
 
     def test_position_success(self, monkeypatch):
         c = make_client([(0, "", "")], monkeypatch)
-        r = c.post("/api/v1/drives/nst1/position", json={"operation": "fsf", "count": 1, "confirm": True})
+        r = c.post("/api/v1/drives/nst1/position?async=false", json={"operation": "fsf", "count": 1, "confirm": True})
         assert r.json()["code"] == "POSITION_SUCCESS"
 
     def test_position_invalid_operation(self, monkeypatch):
         c = make_client([], monkeypatch)
-        r = c.post("/api/v1/drives/nst1/position", json={"operation": "format_c", "count": 1, "confirm": True})
+        r = c.post("/api/v1/drives/nst1/position?async=false", json={"operation": "format_c", "count": 1, "confirm": True})
         assert r.status_code == 400
         assert r.json()["detail"]["code"] == "INVALID_OPERATION"
 
     def test_position_injection_rejected(self, monkeypatch):
         c = make_client([], monkeypatch)
-        r = c.post("/api/v1/drives/nst0;rm%20-rf/position", json={"operation": "fsf", "count": 1})
+        r = c.post("/api/v1/drives/nst0;rm%20-rf/position?async=false", json={"operation": "fsf", "count": 1})
         assert r.status_code in (400, 404)
         # ensure mock runner never executed anything for injection attempts
         if r.status_code == 400:
@@ -251,13 +251,13 @@ class TestDriveAPI:
 class TestIOAPI:
     def test_read_success(self, monkeypatch):
         c = make_client([(0, "1024+0 records in\n", "1073741824 bytes copied\n")], monkeypatch)
-        r = c.post("/api/v1/read", json={"drive": "/dev/nst1", "block_size": "1M", "confirm": True})
+        r = c.post("/api/v1/read?async=false", json={"drive": "/dev/nst1", "block_size": "1M", "confirm": True})
         body = r.json()
         assert body["code"] == "READ_SUCCESS" and "command_id" in body["data"]
 
     def test_read_to_file(self, monkeypatch):
         c = make_client([(0, "", "512 bytes copied\n")], monkeypatch)
-        r = c.post("/api/v1/read", json={"drive": "/dev/nst1", "block_size": "1M",
+        r = c.post("/api/v1/read?async=false", json={"drive": "/dev/nst1", "block_size": "1M",
                                          "file": "/root/f2", "confirm": True})
         body = r.json()
         assert body["code"] == "READ_SUCCESS" and body["data"]["file"] == "/root/f2"
@@ -266,19 +266,19 @@ class TestIOAPI:
 
     def test_read_rejects_bad_file(self, monkeypatch):
         c = make_client([(0, "", "")], monkeypatch)
-        r = c.post("/api/v1/read", json={"drive": "/dev/nst1", "file": "relative/x", "confirm": True})
+        r = c.post("/api/v1/read?async=false", json={"drive": "/dev/nst1", "file": "relative/x", "confirm": True})
         assert r.status_code == 400
-        r = c.post("/api/v1/read", json={"drive": "/dev/nst1", "file": "/dev/nst0", "confirm": True})
+        r = c.post("/api/v1/read?async=false", json={"drive": "/dev/nst1", "file": "/dev/nst0", "confirm": True})
         assert r.status_code == 400
 
     def test_read_legacy_alias(self, monkeypatch):
         c = make_client([(0, "", "")], monkeypatch)
-        r = c.post("/api/v1/tests/read", json={"drive": "/dev/nst1", "block_size": "1M", "confirm": True})
+        r = c.post("/api/v1/tests/read?async=false", json={"drive": "/dev/nst1", "block_size": "1M", "confirm": True})
         assert r.json()["code"] == "READ_SUCCESS"
 
     def test_read_requires_confirm(self, monkeypatch):
         c = make_client([(0, "", "")], monkeypatch)
-        r = c.post("/api/v1/tests/read", json={"drive": "/dev/nst1", "confirm": False})
+        r = c.post("/api/v1/tests/read?async=false", json={"drive": "/dev/nst1", "confirm": False})
         assert r.status_code == 400
 
     def test_write_unauthorized(self, monkeypatch):
@@ -286,7 +286,7 @@ class TestIOAPI:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([], None)
-        r = c.post("/api/v1/write",
+        r = c.post("/api/v1/write?async=false",
                    json={"drive": "/dev/nst1", "size_mb": 1024, "allow_write": False, "confirm": True})
         assert r.status_code == 403
         assert r.json()["detail"]["code"] == "WRITE_OPERATION_NOT_AUTHORIZED"
@@ -296,7 +296,7 @@ class TestIOAPI:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([(0, "1024+0 records out\n", "1073741824 bytes copied\n")], None)
-        r = c.post("/api/v1/write",
+        r = c.post("/api/v1/write?async=false",
                    json={"drive": "/dev/nst1", "media": "IBM015LA", "size_mb": 1024,
                          "allow_write": True, "confirm": True})
         assert r.json()["code"] == "WRITE_SUCCESS"
@@ -308,7 +308,7 @@ class TestIOAPI:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([(0, "", "")], None)
-        r = c.post("/api/v1/tests/write",
+        r = c.post("/api/v1/tests/write?async=false",
                    json={"drive": "/dev/nst1", "test_media": "IBM015LA", "size_mb": 1,
                          "allow_write": True, "confirm": True})
         assert r.json()["code"] == "WRITE_SUCCESS"
@@ -320,7 +320,7 @@ class TestIOAPI:
         f = tmp_path / "f1.bin"
         f.write_bytes(b"x" * 4096)
         c = make_client([(0, "", "4096 bytes copied\n")], None)
-        r = c.post("/api/v1/write",
+        r = c.post("/api/v1/write?async=false",
                    json={"drive": "/dev/nst1", "media": "IBM015LA", "file": str(f),
                          "allow_write": True, "confirm": True})
         body = r.json()
@@ -334,15 +334,15 @@ class TestIOAPI:
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([], None)
         # 相对路径拒绝
-        r = c.post("/api/v1/write", json={"drive": "/dev/nst1", "media": "X",
+        r = c.post("/api/v1/write?async=false", json={"drive": "/dev/nst1", "media": "X",
                                           "file": "rel/f", "allow_write": True, "confirm": True})
         assert r.status_code == 400
         # 设备路径拒绝
-        r = c.post("/api/v1/write", json={"drive": "/dev/nst1", "media": "X",
+        r = c.post("/api/v1/write?async=false", json={"drive": "/dev/nst1", "media": "X",
                                           "file": "/dev/zero", "allow_write": True, "confirm": True})
         assert r.status_code == 400
         # 不存在文件拒绝
-        r = c.post("/api/v1/write", json={"drive": "/dev/nst1", "media": "X",
+        r = c.post("/api/v1/write?async=false", json={"drive": "/dev/nst1", "media": "X",
                                           "file": "/no/such/file.bin", "allow_write": True, "confirm": True})
         assert r.status_code in (400, 404)
 
@@ -351,7 +351,7 @@ class TestIOAPI:
         monkeypatch.setattr(cfg.settings, "tape_api_mode", "FULL")
         monkeypatch.setattr(cfg.settings, "allow_write", True)
         c = make_client([], None)
-        r = c.post("/api/v1/tests/erase", json={"drive": "/dev/nst1", "allow_write": False, "confirm": False})
+        r = c.post("/api/v1/tests/erase?async=false", json={"drive": "/dev/nst1", "allow_write": False, "confirm": False})
         assert r.status_code == 403
         assert r.json()["detail"]["code"] == "DESTRUCTIVE_OPERATION_NOT_AUTHORIZED"
 
@@ -371,7 +371,7 @@ class TestSecurity:
 
     def test_huge_slot_rejected(self, monkeypatch):
         c = make_client([], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/load", json={"slot": 10 ** 12, "drive": 0, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/load?async=false", json={"slot": 10 ** 12, "drive": 0, "confirm": True})
         assert r.status_code == 400
 
     def test_safety_endpoint(self, monkeypatch):

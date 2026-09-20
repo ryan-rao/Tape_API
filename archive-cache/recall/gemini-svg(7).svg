@@ -1,0 +1,258 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900" width="100%" height="100%">
+  <!-- 样式定义 -->
+  <style>
+    .title-main { font-family: system-ui, -apple-system, sans-serif; font-size: 24px; font-weight: 800; fill: #0f172a; text-anchor: middle; }
+    .title-sub { font-family: system-ui, -apple-system, sans-serif; font-size: 13px; fill: #64748b; text-anchor: middle; }
+    .title-layer { font-family: system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 700; fill: #1e293b; }
+    .title-node { font-family: system-ui, -apple-system, sans-serif; font-size: 13px; font-weight: 700; fill: #0f172a; }
+    .text-desc { font-family: system-ui, -apple-system, sans-serif; font-size: 11px; fill: #475569; line-height: 1.4; }
+    .text-tag { font-family: system-ui, -apple-system, sans-serif; font-size: 9px; font-weight: 700; fill: #ffffff; text-anchor: middle; }
+    .text-link { font-family: system-ui, -apple-system, sans-serif; font-size: 10px; font-weight: 700; fill: #ffffff; text-anchor: middle; }
+  </style>
+
+  <defs>
+    <!-- 现代化软阴影 -->
+    <filter id="card-shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.05" />
+    </filter>
+    <filter id="element-shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.03" />
+    </filter>
+
+    <!-- 渐变色定义 -->
+    <linearGradient id="blue-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb" />
+      <stop offset="100%" stop-color="#1d4ed8" />
+    </linearGradient>
+    <linearGradient id="orange-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f97316" />
+      <stop offset="100%" stop-color="#ea580c" />
+    </linearGradient>
+    <linearGradient id="green-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+
+    <!-- 数据流向精密箭头 -->
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#2563eb" />
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#f97316" />
+    </marker>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <!-- 柔和的画布底色 -->
+  <rect width="100%" height="100%" fill="#f8fafc" rx="16" />
+
+  <!-- ==================== 1. 顶部标题 ==================== -->
+  <g transform="translate(600, 45)">
+    <text class="title-main">IBM Storage Scale 极高性能 AI 存储架构</text>
+    <text class="title-sub" y="24">InfiniBand HDR 200Gb/s 极速网络 · GPU 零拷贝 RDMA 直读 · 统一命名空间远程挂载 (Remote Mount)</text>
+  </g>
+
+  <!-- ==================== 2. 计算层 (GPU Worker & Dev/Test Cluster) ==================== -->
+  <g transform="translate(50, 100)" filter="url(#card-shadow)">
+    <!-- 容器面板 -->
+    <rect width="1100" height="190" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5" />
+    <path d="M 0 12 A 12 12 0 0 1 12 0 L 1088 0 A 12 12 0 0 1 1100 12 L 1100 38 L 0 38 Z" fill="#f1f5f9" />
+    <rect x="15" y="12" width="5" height="14" rx="1.5" fill="#3b82f6" />
+    <text x="28" y="24" class="title-layer">计算节点与消费层 (Compute &amp; Consumption Layer)</text>
+
+    <!-- GPU Worker (生产集群) -->
+    <g transform="translate(20, 52)" filter="url(#element-shadow)">
+      <rect width="330" height="120" rx="8" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" />
+      <rect x="8" y="8" width="314" height="28" rx="5" fill="#1e293b" />
+      <text x="165" y="26" class="title-node" fill="#ffffff" text-anchor="middle">GPU Worker 集群 (60× Nodes)</text>
+      
+      <text x="18" y="54" class="text-desc" font-weight="600">• 物理规格：每个节点 8× NVIDIA H100 SXM5</text>
+      <text x="18" y="72" class="text-desc" font-weight="600">• 挂载通道：本地 POSIX 挂载点 (/mnt/scale)</text>
+      <text x="18" y="90" class="text-desc">• 接入机制：CSI 容器挂载 + 原生 GPFS Client</text>
+      <rect x="15" y="98" width="300" height="16" rx="3" fill="#eff6ff" />
+      <text x="165" y="110" class="text-desc" font-size="10" font-weight="700" fill="#1d4ed8" text-anchor="middle">⚡ 训练加速：POSIX + CSI 双通道直读</text>
+    </g>
+
+    <!-- Kubernetes CSI Controller -->
+    <g transform="translate(370, 52)" filter="url(#element-shadow)">
+      <rect width="330" height="120" rx="8" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" />
+      <rect x="8" y="8" width="314" height="28" rx="5" fill="#0284c7" />
+      <text x="165" y="26" class="title-node" fill="#ffffff" text-anchor="middle">Kubernetes CSI 存储编排</text>
+      
+      <text x="18" y="54" class="text-desc">• 核心组件：IBM Storage Scale CSI Driver</text>
+      <text x="18" y="72" class="text-desc">• 挂载模式：动态创建 PV 并无缝映射容器卷</text>
+      <text x="18" y="90" class="text-desc">• 业务特点：适配 K8s 大规模容器化 AI 训练任务</text>
+      <rect x="15" y="98" width="300" height="16" rx="3" fill="#f0f9ff" />
+      <text x="165" y="110" class="text-desc" font-size="10" font-weight="700" fill="#0369a1" text-anchor="middle">动态资源流转，保障高密算力存取</text>
+    </g>
+
+    <!-- Dev/Test Federation Cluster -->
+    <g transform="translate(720, 52)" filter="url(#element-shadow)">
+      <rect width="360" height="120" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="4,3" />
+      <rect x="8" y="8" width="344" height="28" rx="5" fill="#475569" />
+      <text x="180" y="26" class="title-node" fill="#ffffff" text-anchor="middle">Dev/Test Cluster Federation</text>
+      
+      <text x="18" y="54" class="text-desc" font-weight="600">• 跨集群挂载：Remote Mount 远程共享生产卷</text>
+      <text x="18" y="72" class="text-desc">• 安全隔离：开发/测试节点拥有“只读”权限</text>
+      <text x="18" y="90" class="text-desc">• 架构收益：无需拷贝生产数据，零开销快速验证</text>
+      <rect x="15" y="98" width="330" height="16" rx="3" fill="#f1f5f9" />
+      <text x="180" y="110" class="text-desc" font-size="10" font-weight="700" fill="#475569" text-anchor="middle">统一命名空间，实现多集群高效共享</text>
+    </g>
+  </g>
+
+  <!-- ==================== 3. 极速核心网络背板 (Network Fabrics) ==================== -->
+  <g transform="translate(50, 310)">
+    <!-- IB HDR 200G Fabric -->
+    <rect x="0" y="0" width="540" height="42" rx="6" fill="url(#blue-grad)" filter="url(#element-shadow)" />
+    <text x="270" y="25" class="text-link" font-size="12">🚀 数据平面：InfiniBand HDR 200Gb/s Fabric (RDMA 零拷贝高速网)</text>
+
+    <!-- 100GbE Network -->
+    <rect x="560" y="0" width="540" height="42" rx="6" fill="url(#orange-grad)" filter="url(#element-shadow)" />
+    <text x="830" y="25" class="text-link" font-size="12">🔌 统一控制与管理面：100GbE 核心管理交换网</text>
+  </g>
+
+  <!-- ==================== 4. 协议接入层 (CES Gateways) ==================== -->
+  <g transform="translate(50, 372)" filter="url(#card-shadow)">
+    <rect width="1100" height="135" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5" />
+    <path d="M 0 12 A 12 12 0 0 1 12 0 L 1088 0 A 12 12 0 0 1 1100 12 L 1100 38 L 0 38 Z" fill="#fff7ed" />
+    <rect x="15" y="12" width="5" height="14" rx="1.5" fill="#f97316" />
+    <text x="28" y="24" class="title-layer">集群协议网关服务层 (CES Protocol Gateways)</text>
+
+    <!-- CES-01 -->
+    <g transform="translate(100, 50)" filter="url(#element-shadow)">
+      <rect width="400" height="70" rx="6" fill="#ffffff" stroke="#f97316" stroke-width="1.2" />
+      <text x="200" y="22" class="title-node" fill="#ea580c" text-anchor="middle">CES-01 协议网关</text>
+      <rect x="8" y="28" width="384" height="34" rx="4" fill="#fff7ed" />
+      <text x="200" y="42" class="text-desc" font-weight="800" fill="#ea580c" text-anchor="middle">多协议文件共享: NFSv4.1 / SMB 3.0</text>
+      <text x="200" y="54" class="text-desc" font-size="10" text-anchor="middle" fill="#9a3412">打通传统业务与标准客户端的高效共享协同</text>
+    </g>
+
+    <!-- CES-02 -->
+    <g transform="translate(600, 50)" filter="url(#element-shadow)">
+      <rect width="400" height="70" rx="6" fill="#ffffff" stroke="#f97316" stroke-width="1.2" />
+      <text x="200" y="22" class="title-node" fill="#ea580c" text-anchor="middle">CES-02 协议网关</text>
+      <rect x="8" y="28" width="384" height="34" rx="4" fill="#fff7ed" />
+      <text x="200" y="42" class="text-desc" font-weight="800" fill="#ea580c" text-anchor="middle">对象接口存储: S3 API</text>
+      <text x="200" y="54" class="text-desc" font-size="10" text-anchor="middle" fill="#9a3412">对接现代化 AI 容器与多模态海量非结构化数据湖</text>
+    </g>
+  </g>
+
+  <!-- ==================== 5. 存储节点与高可用恢复组 (NSD Storage Layer) ==================== -->
+  <g transform="translate(50, 525)" filter="url(#card-shadow)">
+    <rect width="1100" height="235" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5" />
+    <path d="M 0 12 A 12 12 0 0 1 12 0 L 1088 0 A 12 12 0 0 1 1100 12 L 1100 38 L 0 38 Z" fill="#f8fafc" />
+    <rect x="15" y="12" width="5" height="14" rx="1.5" fill="#334155" />
+    <text x="28" y="24" class="title-layer">物理 NSD 磁盘节点与高可用恢复组 (GPFS NSD Layer)</text>
+
+    <!-- NSD 数据节点群 -->
+    <g transform="translate(20, 50)" filter="url(#element-shadow)">
+      <rect width="520" height="165" rx="8" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2" />
+      <rect x="8" y="8" width="504" height="28" rx="5" fill="#334155" />
+      <text x="260" y="26" class="title-node" fill="#ffffff" text-anchor="middle">IBM Storage Scale NSD 数据节点 × 12</text>
+      
+      <rect x="10" y="42" width="500" height="20" rx="3" fill="#f1f5f9" />
+      <text x="260" y="55" class="title-node" font-size="10" text-anchor="middle" fill="#334155">硬件总配：每个节点 24× 企业级 NVMe SSD 极速直连</text>
+
+      <!-- 共享 NSD 分配 -->
+      <g transform="translate(10, 70)">
+        <rect width="155" height="85" rx="4" fill="#eff6ff" stroke="#93c5fd" />
+        <text x="77.5" y="18" class="title-node" font-size="11" text-anchor="middle">NSD-01 ~ NSD-04</text>
+        <rect x="8" y="26" width="139" height="16" rx="2" fill="#1d4ed8" />
+        <text x="77.5" y="37" class="text-tag" font-size="8">GPFS SYSTEM POOL</text>
+        <text x="12" y="58" class="text-desc" font-size="9">• 物理底层极速文件索引</text>
+        <text x="12" y="71" class="text-desc" font-size="9">• 高 IOPS / 极低读写延迟</text>
+      </g>
+
+      <g transform="translate(172, 70)">
+        <rect width="155" height="85" rx="4" fill="#fff7ed" stroke="#fdba74" />
+        <text x="77.5" y="18" class="title-node" font-size="11" text-anchor="middle">NSD-05 ~ NSD-08</text>
+        <rect x="8" y="26" width="139" height="16" rx="2" fill="#ea580c" />
+        <text x="77.5" y="37" class="text-tag" font-size="8">DATA POOL A (EC 8+2)</text>
+        <text x="12" y="58" class="text-desc" font-size="9">• AI 训练核心热数据</text>
+        <text x="12" y="71" class="text-desc" font-size="9">• 提供多节点并发大带宽</text>
+      </g>
+
+      <g transform="translate(335, 70)">
+        <rect width="155" height="85" rx="4" fill="#faf5ff" stroke="#d8b4fe" />
+        <text x="77.5" y="18" class="title-node" font-size="11" text-anchor="middle">NSD-09 ~ NSD-12</text>
+        <rect x="8" y="26" width="139" height="16" rx="2" fill="#7c3aed" />
+        <text x="77.5" y="37" class="text-tag" font-size="8">DATA POOL B (EC 8+2)</text>
+        <text x="12" y="58" class="text-desc" font-size="9">• 存储高吞吐模型权重</text>
+        <text x="12" y="71" class="text-desc" font-size="9">• 支持开发测试只读挂载</text>
+      </g>
+    </g>
+
+    <!-- EC Recovery Group (纠删码恢复组) -->
+    <g transform="translate(560, 50)" filter="url(#element-shadow)">
+      <rect width="520" height="165" rx="8" fill="#f0fdf4" stroke="#86efac" stroke-width="1.2" />
+      <rect x="8" y="8" width="504" height="28" rx="5" fill="#16a34a" />
+      <text x="260" y="26" class="title-node" fill="#ffffff" text-anchor="middle">纠删码恢复组 (EC Recovery Group - 8 Data + 2 Parity)</text>
+
+      <!-- 纠删码条带图解 -->
+      <g transform="translate(15, 45)">
+        <rect x="0" y="0" width="30" height="34" rx="3" fill="#ffffff" stroke="#16a34a" stroke-width="1" />
+        <text x="15" y="21" class="title-node" font-size="10" fill="#16a34a" text-anchor="middle">D1</text>
+        <rect x="35" y="0" width="30" height="34" rx="3" fill="#ffffff" stroke="#16a34a" stroke-width="1" />
+        <text x="50" y="21" class="title-node" font-size="10" fill="#16a34a" text-anchor="middle">D2</text>
+        <rect x="70" y="0" width="30" height="34" rx="3" fill="#ffffff" stroke="#16a34a" stroke-width="1" />
+        <text x="85" y="21" class="title-node" font-size="10" fill="#16a34a" text-anchor="middle">D3</text>
+        <text x="110" y="22" class="title-node" font-size="12" fill="#16a34a" text-anchor="middle">...</text>
+        <rect x="125" y="0" width="30" height="34" rx="3" fill="#ffffff" stroke="#16a34a" stroke-width="1" />
+        <text x="140" y="21" class="title-node" font-size="10" fill="#16a34a" text-anchor="middle">D8</text>
+
+        <!-- 加号 -->
+        <text x="165" y="23" class="title-node" font-size="14" fill="#16a34a" text-anchor="middle">+</text>
+
+        <rect x="180" y="0" width="30" height="34" rx="3" fill="#f0fdf4" stroke="#b91c1c" stroke-width="1.2" />
+        <text x="195" y="21" class="title-node" font-size="10" fill="#b91c1c" text-anchor="middle">P1</text>
+        <rect x="215" y="0" width="30" height="34" rx="3" fill="#f0fdf4" stroke="#b91c1c" stroke-width="1.2" />
+        <text x="230" y="21" class="title-node" font-size="10" fill="#b91c1c" text-anchor="middle">P2</text>
+        
+        <text x="255" y="21" class="text-desc" font-size="10" fill="#15803d" font-weight="700">🛡️ 具备任意故障 2 个节点不丢数据的高安全性</text>
+      </g>
+
+      <!-- 文字说明 -->
+      <rect x="15" y="90" width="490" height="63" rx="4" fill="#ffffff" stroke="#dcfce7" />
+      <text x="22" y="107" class="text-desc" font-weight="700" fill="#16a34a">核心高韧性架构设计：</text>
+      <text x="22" y="123" class="text-desc">• 数据跨 12 个物理存储节点进行 EC 8+2 条带化分布式校验，无需额外热备盘。</text>
+      <text x="22" y="137" class="text-desc">• 任何磁盘或节点物理离线时，系统可启动全集群并发、自愈式重构，重构速度极快。</text>
+    </g>
+  </g>
+
+  <!-- ==================== 6. 核心数据流连线 ==================== -->
+  
+  <!-- 🚀 数据路径 (RDMA): GPU <-> NSD (蓝色双向，极宽通道) -->
+  <path d="M 210 270 L 210 525" fill="none" stroke="#2563eb" stroke-width="4.5" marker-start="url(#arrow-blue)" marker-end="url(#arrow-blue)" />
+  <rect x="115" y="280" width="190" height="20" rx="4" fill="#2563eb" />
+  <text x="210" y="294" class="text-link">🚀 数据路径 (RDMA) 零拷贝直读</text>
+
+  <!-- 🔌 协议导出: CES -> GPU / 传统客户端 (橙色双向) -->
+  <path d="M 545 372 L 545 270" fill="none" stroke="#f97316" stroke-width="2.5" marker-start="url(#arrow-orange)" marker-end="url(#arrow-orange)" />
+  <rect x="450" y="280" width="190" height="20" rx="4" fill="#f97316" />
+  <text x="545" y="294" class="text-link">🔌 协议导出: NFS/SMB/S3 via CES</text>
+
+  <!-- 🔗 Remote Mount: Federation 只读跨集群挂载 (灰色双向) -->
+  <path d="M 900 270 L 900 525" fill="none" stroke="#64748b" stroke-width="2.5" stroke-dasharray="6,4" marker-end="url(#arrow-gray)" />
+  <rect x="805" y="280" width="190" height="20" rx="4" fill="#64748b" />
+  <text x="900" y="294" class="text-link">🔗 Federation Remote Mount (只读)</text>
+
+  <!-- ==================== 7. 底部专业图例 (Legend) ==================== -->
+  <g transform="translate(50, 775)" filter="url(#card-shadow)">
+    <rect width="1100" height="75" rx="8" fill="#0f172a" />
+    <text x="20" y="25" font-family="system-ui, sans-serif" font-size="11" fill="#38bdf8" font-weight="800">IBM Storage Scale 原生架构组件解析：</text>
+    
+    <g transform="translate(20, 32)">
+      <!-- Item 1 -->
+      <circle cx="10" cy="15" r="5" fill="#3b82f6" />
+      <text x="22" y="19" font-family="system-ui, sans-serif" font-size="11" fill="#f8fafc" font-weight="700">RDMA 零拷贝直读：</text>
+      <text x="130" y="19" font-family="system-ui, sans-serif" font-size="11" fill="#94a3b8">计算节点（GPU Worker）直接通过 InfiniBand HDR 高速网络，越过操作系统 CPU 与协议开销，直接访问物理 NSD，确保 H100 训练算力不被 IO 饥饿阻碍。</text>
+
+      <!-- Item 2 -->
+      <circle cx="680" cy="15" r="5" fill="#f97316" />
+      <text x="692" y="19" font-family="system-ui, sans-serif" font-size="11" fill="#f8fafc" font-weight="700">CES：</text>
+      <text x="730" y="19" font-family="system-ui, sans-serif" font-size="11" fill="#94a3b8">集群导出服务。统一对集群外应用、AI 数据湖、传统多协议应用提供 NFS、SMB 和高性能 S3 存储。 </text>
+    </g>
+  </g>
+</svg>

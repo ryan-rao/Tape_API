@@ -1,0 +1,298 @@
+"""Archive gateway HTTP API, mounted under /api/v1/archive."""
+import hashlib
+import os
+import uuid
+
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, PlainTextResponse
+from pydantic import BaseModel, Field
+
+from app.models.common import fail, ok
+from app.security.policy import require_level
+from app.api.routes import submit_or_run
+
+from .manager import GatewayError
+
+
+def _http(e: GatewayError):
+    return HTTPException(status_code=e.status, detail={"code": e.code, "message": e.message})
+
+
+def _gw(request: Request):
+    gw = getattr(request.app.state, "gateway", None)
+    if gw is None:
+        raise HTTPException(status_code=503, detail={
+            "code": "GATEWAY_UNAVAILABLE",
+            "message": "archive gateway disabled or failed to start (check PG / logs)"})
+    return gw
+
+
+router = APIRouter(prefix="/api/v1/archive", tags=["Archive"])
+
+
+class MediaRegister(BaseModel):
+    barcode: str = Field(min_length=1, max_length=64)
+    state: str = Field(default="appendable", pattern="^(unknown|scratch|appendable|full|faulted)$")
+
+
+# ---------- meta ----------
+@router.get("/config")
+def gw_config(request: Request):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    return ok(gw.cfg.summary(), request_id=request.state.request_id)
+
+
+@router.get("/stats")
+def gw_stats(request: Request):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        return ok(gw.stats(), request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.get("/metrics")
+def gw_metrics(request: Request):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    return PlainTextResponse(gw.metrics_prom(), media_type="text/plain; version=0.0.4")
+
+
+@router.post("/selfheal")
+def gw_selfheal(request: Request):
+    require_level("LEVEL_2")
+    gw = _gw(request)
+    try:
+        return ok(gw._self_heal(), code="SELFHEAL_DONE", request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.post("/evict")
+def gw_evict(request: Request):
+    require_level("LEVEL_2")
+    gw = _gw(request)
+    try:
+        return ok(gw.enforce_watermarks(force=True), code="EVICTION_DONE",
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+# ---------- files ----------
+@router.post("/upload")
+async def gw_upload(request: Request, file: UploadFile = File(...)):
+    require_level("LEVEL_2")
+    gw = _gw(request)
+    try:
+        safe = os.path.basename(file.filename or "unnamed")[:255] or "unnamed"
+        stored = "%s_%s" % (uuid.uuid4().hex[:12], safe)
+        dest = os.path.join(gw.cfg.cache_dir, "upload", stored)
+        h = hashlib.sha256()
+        size = 0
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                h.update(chunk)
+                size += len(chunk)
+        res = gw.upload(dest, safe, size, sha256=h.hexdigest(),
+                        content_type=file.content_type, origin="api")
+        code = "TAPE_ARCHIVE_QUEUED" if res["route"] == "tape" else "CONTAINER_BUFFERED"
+        return ok(res, code=code, request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.get("/files")
+def gw_files(request: Request, name: str = None, state: str = None,
+             limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        rows = gw.db.find_files(name, limit=limit) if name else gw.db.list_files(
+            state=state, limit=limit, offset=offset)
+        return ok({"count": len(rows), "items": [dict(r) for r in rows]},
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.get("/files/{file_id}")
+def gw_file_get(request: Request, file_id: str):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        res = gw.resolve(file_id)
+        return ok({"hit": res["hit"], "mode": res.get("mode"), "file": dict(res["file"]),
+                   "block": dict(res["block"]) if res.get("block") else None,
+                   "container": dict(res["container"]) if res.get("container") else None},
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.get("/files/{file_id}/download")
+def gw_download(request: Request, file_id: str, full_container: bool = False):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    recall_dir = os.path.join(gw.cfg.cache_dir, "recall")
+    try:
+        res = gw.resolve(file_id)
+    except GatewayError as e:
+        raise _http(e)
+    if res["hit"] in ("cache", "container_cache"):
+        try:
+            path = gw.download(file_id, recall_dir,
+                               force_full_container=full_container)
+            return FileResponse(path, filename=os.path.basename(path),
+                                media_type="application/octet-stream")
+        except GatewayError as e:
+            raise _http(e)
+
+    # cold path: recall runs as an async job (progress + retries); the job
+    # result carries the local path -- re-GET streams it from cache.
+    def target():
+        try:
+            path = gw.recall_direct(file_id, recall_dir,
+                                   force_full_container=full_container)
+            return ok({"file_id": file_id, "path": path,
+                       "hint": "recall complete; GET download again to stream"},
+                      code="RECALLED", request_id=request.state.request_id)
+        except GatewayError as e:
+            raise _http(e)
+
+    return submit_or_run(request, "gateway-recall", target)
+
+
+# ---------- containers ----------
+@router.get("/containers")
+def gw_containers(request: Request, state: str = None,
+                  limit: int = Query(50, ge=1, le=500)):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        rows = gw.db.container_list(state=state, limit=limit)
+        return ok({"count": len(rows), "items": [dict(r) for r in rows]},
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.get("/containers/{container_id}")
+def gw_container_get(request: Request, container_id: str):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        cont = gw.db.container_get(container_id)
+        if cont is None:
+            return fail("NOT_FOUND", "no such container",
+                        request_id=request.state.request_id)
+        files = gw.db.container_files(container_id)
+        return ok({"container": dict(cont),
+                   "files": [{k: f[k] for k in ("file_id", "filename", "size_bytes",
+                                                "state", "file_offset_in_container")}
+                             for f in files]},
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.post("/containers/{container_id}/seal")
+def gw_container_seal(request: Request, container_id: str):
+    require_level("LEVEL_2")
+    gw = _gw(request)
+    try:
+        if not gw.db.container_seal(container_id):
+            return fail("INVALID_STATE", "container not buffering",
+                        request_id=request.state.request_id)
+        return ok({"container_id": container_id, "state": "flush-due"},
+                  code="CONTAINER_SEALED", request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.post("/containers/{container_id}/retry")
+def gw_container_retry(request: Request, container_id: str):
+    """Revive an aborted/failed container: requeue archive from cached tar."""
+    require_level("LEVEL_2")
+    gw = _gw(request)
+    try:
+        cont = gw.db.container_get(container_id)
+        if cont is None:
+            return fail("NOT_FOUND", "no such container",
+                        request_id=request.state.request_id)
+        tar_path = os.path.join(gw.cfg.cache_dir, "containers",
+                                "%s.tar" % container_id)
+        if cont["state"] not in ("aborted", "flushing", "archiving"):
+            return fail("INVALID_STATE", "container state %s not retryable"
+                        % cont["state"], request_id=request.state.request_id)
+        if not os.path.isfile(tar_path):
+            return fail("TAR_MISSING", "cached tar gone; cannot retry archive",
+                        request_id=request.state.request_id)
+        with gw.db.conn() as conn:
+            gw.db.container_update(conn, container_id, state="flushing", error=None)
+        tid = gw.db.task_create("archive_container", {"container_id": container_id},
+                                container_id=container_id)
+        return ok({"container_id": container_id, "state": "flushing",
+                   "task_id": tid}, code="CONTAINER_REQUEUED",
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+# ---------- media ----------
+@router.get("/media")
+def gw_media(request: Request):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        rows = gw.db.tape_list()
+        return ok({"count": len(rows), "items": [dict(r) for r in rows]},
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.post("/media")
+def gw_media_register(request: Request, body: MediaRegister):
+    require_level("LEVEL_2")
+    gw = _gw(request)
+    try:
+        gw.db.tape_upsert(body.barcode, state=body.state)
+        return ok({"barcode": body.barcode, "state": body.state}, code="MEDIA_REGISTERED",
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+# ---------- tasks ----------
+@router.get("/tasks")
+def gw_tasks(request: Request, kind: str = None, state: str = None,
+             limit: int = Query(50, ge=1, le=500)):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        rows = gw.db.task_list(kind=kind, state=state, limit=limit)
+        return ok({"count": len(rows), "items": [dict(r) for r in rows]},
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
+@router.get("/tasks/{task_id}")
+def gw_task_get(request: Request, task_id: str):
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        t = gw.db.task_get(task_id)
+        if t is None:
+            return fail("TASK_NOT_FOUND", "no such task",
+                        request_id=request.state.request_id)
+        return ok(dict(t), request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)

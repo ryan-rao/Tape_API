@@ -23,7 +23,7 @@ def drv(script=None, monkeypatch=None):
 
 
 def post(c, path, body=None, code=200):
-    r = c.post("/api/v1/drives/nst1" + path, json=body or {"confirm": True})
+    r = c.post("/api/v1/drives/nst1" + path + "?async=false", json=body or {"confirm": True})
     assert r.status_code == code, (path, r.status_code, r.text)
     return r.json()
 

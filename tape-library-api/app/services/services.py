@@ -252,6 +252,7 @@ class LibraryService(BaseService):
         self.mtx = MtxAdapter()
         self.mt = MtAdapter()
         self.attr = SgAttrAdapter()
+        self.sg = SgAdapter()
 
     def _lock(self, changer):
         if not self.runner.locks.acquire(changer):
@@ -314,6 +315,78 @@ class LibraryService(BaseService):
             return None
         m = re.search(r"^\s*Barcode:\s*(\S+)", rec2["stdout"], re.M)
         return m.group(1) if m else None
+
+    # ---------- 带机 SN 解析与状态探测（v1.2） ----------
+    _SN_TTL = 3600.0
+    _sn_map_cache = None  # (ts, {sn_lower: {"nst","sg","serial"}})
+
+    def _drive_sn_map(self):
+        """sg_inq 扫全部 TAPE 设备 → 序列号映射（类级缓存 1h，硬件静态事实）。"""
+        import time as _t
+        from app.commands import parsers
+        now = _t.time()
+        cls = LibraryService
+        if cls._sn_map_cache and now - cls._sn_map_cache[0] < cls._SN_TTL:
+            return cls._sn_map_cache[1]
+        mapping = {}
+        for d in self._tape_devices():
+            sg = (d.get("sg_device") or "").replace("/dev/", "")
+            nst = (d.get("nst_device") or "").replace("/dev/", "")
+            if not sg:
+                continue
+            try:
+                rec = self.exec(self.sg.inquiry(sg), "INQUIRY", "LEVEL_1", device=sg, timeout=15)
+            except Exception:
+                continue
+            if rec["exit_code"] != 0:
+                continue
+            sn = (parsers.parse_sg_inq(rec["stdout"]).get("unit_serial_number") or "").strip()
+            if sn:
+                mapping[sn.lower()] = {"nst": nst, "sg": sg, "serial": sn}
+        cls._sn_map_cache = (now, mapping)
+        return mapping
+
+    def _drive_by_sn(self, sn):
+        want = re.sub(r"[^0-9a-z]", "", str(sn).strip().lower())
+        if not want:
+            raise ServiceError("INVALID_REQUEST", "drive_sn 为空")
+        m = self._drive_sn_map()
+        hit = m.get(want)
+        if not hit:
+            cands = [v for k, v in m.items() if k.endswith(want) or want.endswith(k)]
+            if len(cands) == 1:
+                hit = cands[0]
+        if not hit:
+            raise ServiceError("DRIVE_NOT_FOUND",
+                               "带机 SN %s 不存在；已知：%s（见 GET /drives/list）" %
+                               (sn, ",".join(sorted(v["serial"] for v in m.values())) or "探测失败"))
+        return hit
+
+    def _nst_for_dte(self, dte):
+        for nst, d in self._env_drive_map().items():
+            if d == int(dte):
+                return nst
+        return None
+
+    def _drive_health(self, nst):
+        """带机健康探测（mt status，LEVEL_1）：失败→DRIVE_UNREACHABLE；
+        not ready→DRIVE_NOT_READY。返回精简状态；是否有带由 mtx status 层拦截。"""
+        from app.commands import parsers
+        try:
+            rec = self.exec(self.mt.status(nst), "DRIVE_STATUS", "LEVEL_1", device=nst, timeout=20)
+        except Exception as e:
+            raise ServiceError("DRIVE_UNREACHABLE", "带机 /dev/%s 探测失败: %s" % (nst, str(e)[:120]))
+        if rec["exit_code"] != 0:
+            if "not ready" in (rec["stdout"] + rec["stderr"]).lower():
+                raise ServiceError("DRIVE_NOT_READY", "带机 /dev/%s 未就绪（becoming ready 或需复位）" % nst)
+            raise ServiceError("DRIVE_UNREACHABLE", "带机 /dev/%s mt status 失败" % nst)
+        p = parsers.parse_mt_status(rec["stdout"])
+        if p.get("tape_online") and (p.get("file_number") or -1) >= 0 \
+                and "IN_LOADED" not in (p.get("flags") or []):
+            # mt 显示在机但 mtx status 判空属于矛盾态，交由后续 status 守卫处理，此处仅记录
+            pass
+        return {"nst": nst, "tape_online": bool(p.get("tape_online")),
+                "flags": p.get("flags") or [], "file_number": p.get("file_number")}
 
     def _resolve_drive_ref(self, ref, status):
         """带机位置参数 → (mtx DTE 号, 解析方法, 备注)。
@@ -426,34 +499,41 @@ class LibraryService(BaseService):
                 "drives": parsed["drives"], "command_id": rec["command_id"]}
 
     def load(self, changer, slot=None, drive=None, barcode=None,
-             tape_position=None, drive_position=None):
-        """槽位→带机装带。位置参数优先级：
-        磁带: barcode(自动定位槽位) > tape_position(S003/slot:3) > slot(旧字段, mtx 元素号)
-        带机: drive_position(nst1/st1/sg2/DTE2/Drive-02/SCSI地址) > drive(旧字段, mtx DTE 号)
-        返回体 resolved.* 说明每个解析结果与方法。"""
+             tape_position=None, drive_position=None, drive_sn=None):
+        """槽位→带机装带。推荐参数（v1.2）：磁带用 barcode（动作前检查：必须位于槽位，
+        已在带机→MEDIA_IN_DRIVE，不在库→MEDIA_NOT_FOUND）；带机用 drive_sn（sg_inq 序列号，
+        动作前检查：可解析→可达→带机为空）。解析优先级：
+        磁带: barcode > tape_position(S003) > slot(旧, mtx 元素号)
+        带机: drive_sn > drive_position(nst1/DTE2/…) > drive(旧, mtx DTE 号)
+        响应 data.checks.* 回显两项前置状态检查，resolved.* 回显解析方法。"""
         from app.security.policy import normalize_device, validate_slot, validate_drive
         self._lock(changer)
         try:
             inv = self._status_inventory(changer)
-            # ① 目标带机
+            # ① 目标带机（drive_sn 优先：SN → nst → DTE，并做可达/健在探测）
             method, note = "raw_element", None
-            if drive_position is not None:
+            probe_nst = None
+            sn_serial = None
+            if drive_sn is not None:
+                dev = self._drive_by_sn(drive_sn)
+                sn_serial = dev.get("serial") or str(drive_sn)
+                probe_nst = dev.get("nst")
+                dte, under, _n2 = self._resolve_drive_ref(probe_nst, inv)
+                drive, method = dte, "drive_sn"
+                note = "SN %s → /dev/%s → DTE%d（底层 %s）" % (sn_serial, probe_nst, dte, under)
+            elif drive_position is not None:
                 drive, method, note = self._resolve_drive_ref(drive_position, inv)
+                probe_nst = self._nst_for_dte(int(drive))
             elif drive is None:
                 raise ServiceError("INVALID_REQUEST",
-                                   "需提供 drive（mtx 元素号）或 drive_position（nst1/DTE2/Drive-02）")
+                                   "需提供 drive_sn（带机序列号）/ drive_position（nst1/DTE2）/ drive（mtx 元素号）")
             drive = validate_drive(int(drive))
-            # ② 磁带位置
+            if probe_nst is None:
+                probe_nst = self._nst_for_dte(drive)
+            drive_probe = self._drive_health(probe_nst) if probe_nst else None
+            # ② 磁带位置 + 状态检查
             src, src_method = None, None
-            if slot is not None:
-                src, src_method = validate_slot(int(slot)), "slot"
-            elif tape_position is not None:
-                kind, val = self._parse_tape_position(tape_position)
-                if kind != "slot":
-                    raise ServiceError("INVALID_REQUEST",
-                                       "load 的 tape_position 需为槽位（S003/slot:3）；跨带机取带请先 unload")
-                src, src_method = validate_slot(val), "tape_position"
-            elif barcode:
+            if barcode:
                 hit = [x for x in inv["slots"] if x.get("occupied") and x.get("barcode") == barcode]
                 if not hit:
                     ind = [x for x in inv["drives"] if x.get("occupied") and x.get("barcode") == barcode]
@@ -462,8 +542,16 @@ class LibraryService(BaseService):
                                            "磁带 %s 已在带机 DTE%d（需先 unload）" % (barcode, ind[0]["drive"]))
                     raise ServiceError("MEDIA_NOT_FOUND", "磁带 %s 不在带库槽位中" % barcode)
                 src, src_method = validate_slot(hit[0]["element"]), "barcode_lookup"
+            elif slot is not None:
+                src, src_method = validate_slot(int(slot)), "slot"
+            elif tape_position is not None:
+                kind, val = self._parse_tape_position(tape_position)
+                if kind != "slot":
+                    raise ServiceError("INVALID_REQUEST",
+                                       "load 的 tape_position 需为槽位（S003/slot:3）；跨带机取带请先 unload")
+                src, src_method = validate_slot(val), "tape_position"
             else:
-                raise ServiceError("INVALID_REQUEST", "需提供 slot / tape_position / barcode 定位磁带")
+                raise ServiceError("INVALID_REQUEST", "需提供 barcode（推荐）/ tape_position / slot 定位磁带")
             srec = self._find_slot(inv, src)
             if barcode and srec and srec.get("barcode") and srec["barcode"] != barcode:
                 raise ServiceError("SLOT_MEDIA_MISMATCH",
@@ -498,6 +586,14 @@ class LibraryService(BaseService):
             self._after_robot_move()
             return {"slot": src, "drive": drive, "barcode": barcode,
                     "changer": normalize_device(changer),
+                    "checks": {
+                        "tape": {"barcode": barcode, "method": src_method,
+                                 "position": "S%03d" % src, "element": src,
+                                 "state": "in_slot"},
+                        "drive": {"serial": sn_serial, "nst": probe_nst, "dte": drive,
+                                  "occupied_before": False, "state": "ready",
+                                  "probe": "ok" if drive_probe else "skipped"},
+                    },
                     "resolved": {"tape": "S%03d" % src, "tape_method": src_method,
                                  "drive": "DTE%d" % drive, "drive_method": method,
                                  "drive_note": note, "mtx_command": rec.get("command"),
@@ -508,8 +604,11 @@ class LibraryService(BaseService):
 
     def unload(self, changer, slot=None, drive=None, barcode=None,
                tape_position=None, drive_position=None):
-        """带机→槽位卸带。磁带: barcode(自动定位所在带机) > drive_position/drive(带机内磁带)；
-        目标槽: slot(旧) > tape_position(S003) > 自动(原槽 source_slot，不行则首个空槽)。"""
+        """带机→槽位卸带。推荐参数（v1.2）：barcode（磁带条码，动作前检查必须在带机：
+        在槽不在机→MEDIA_NOT_IN_DRIVE，查无此带→MEDIA_NOT_FOUND）+ slot（目标槽，
+        动作前检查存在且为空：SLOT_NOT_FOUND / SLOT_OCCUPIED）。slot/tape_position 缺省时
+        自动回原槽(source_slot)，不行则首个空槽。旧字段 drive/drive_position 继续支持。
+        响应 data.checks.* 回显前置状态检查。"""
         from app.security.policy import normalize_device, validate_slot, validate_drive
         self._lock(changer)
         try:
@@ -521,13 +620,20 @@ class LibraryService(BaseService):
             if holders:
                 dte, method = holders[0]["drive"], "barcode_holder"
                 note = "磁带 %s 定位于带机 DTE%d" % (barcode, dte)
+            elif barcode:
+                instream = [x for x in inv["slots"] if x.get("occupied") and x.get("barcode") == barcode]
+                if instream:
+                    raise ServiceError("MEDIA_NOT_IN_DRIVE",
+                                       "磁带 %s 在槽位 S%03d，不在任何带机，无需 unload" %
+                                       (barcode, instream[0]["element"]))
+                raise ServiceError("MEDIA_NOT_FOUND", "磁带 %s 不在带库中" % barcode)
             elif drive_position is not None:
                 dte, method, note = self._resolve_drive_ref(drive_position, inv)
             elif drive is not None:
                 dte = validate_drive(int(drive))
-            if dte is None:
+            else:
                 raise ServiceError("INVALID_REQUEST",
-                                   "需提供 drive/drive_position，或 barcode（磁带在带机时）定位带机")
+                                   "需提供 barcode（推荐）或 drive/drive_position 定位待卸磁带")
             cur = next((x for x in inv["drives"] if x["drive"] == dte), None)
             if not cur or not cur.get("occupied"):
                 raise ServiceError("DRIVE_EMPTY", "带机 DTE%d 为空，无带可卸" % dte)
@@ -588,6 +694,12 @@ class LibraryService(BaseService):
             self._after_robot_move()
             return {"slot": dest, "drive": dte, "barcode": bc,
                     "changer": normalize_device(changer),
+                    "checks": {
+                        "tape": {"barcode": bc, "state": "in_drive", "dte": dte,
+                                 "method": method},
+                        "slot": {"position": "S%03d" % dest, "element": dest,
+                                 "method": dmethod, "state": "empty"},
+                    },
                     "resolved": {"drive": "DTE%d" % dte, "drive_method": method,
                                  "drive_note": note, "target": "S%03d" % dest,
                                  "target_method": dmethod, "mtx_command": rec.get("command"),

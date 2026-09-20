@@ -27,7 +27,7 @@ def last_argv(c):
 class TestLibraryRobot:
     def test_robot_position(self, monkeypatch):
         c = lib([], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/robot/position", json={"element": 1, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/robot/position?async=false", json={"element": 1, "confirm": True})
         assert r.status_code == 200, r.text
         b = r.json()
         assert b["code"] == "POSITION_SUCCESS"
@@ -36,12 +36,12 @@ class TestLibraryRobot:
 
     def test_position_legacy_alias(self, monkeypatch):
         c = lib([], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/position", json={"element": 1, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/position?async=false", json={"element": 1, "confirm": True})
         assert r.status_code == 200 and r.json()["code"] == "POSITION_SUCCESS"
 
     def test_exchange(self, monkeypatch):
         c = lib([], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/exchange", json={"source": 1, "destination": 2, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/exchange?async=false", json={"source": 1, "destination": 2, "confirm": True})
         assert r.status_code == 200, r.text
         b = r.json()
         assert b["code"] == "EXCHANGE_SUCCESS"
@@ -50,7 +50,7 @@ class TestLibraryRobot:
 
     def test_robot_first(self, monkeypatch):
         c = lib([(0, MTX_FIRST, "")], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/robot/first")
+        r = c.post("/api/v1/libraries/sg1/robot/first?async=false")
         assert r.status_code == 200, r.text
         b = r.json()
         assert b["code"] == "FIRST_SUCCESS"
@@ -59,7 +59,7 @@ class TestLibraryRobot:
 
     def test_robot_next(self, monkeypatch):
         c = lib([(0, "Storage Element 2:Empty:VolumeTag=\n", "")], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/robot/next")
+        r = c.post("/api/v1/libraries/sg1/robot/next?async=false")
         assert r.status_code == 200, r.text
         assert r.json()["code"] == "NEXT_SUCCESS"
         assert last_argv(c) == ["mtx", "-f", "/dev/sg1", "next"]
@@ -67,7 +67,7 @@ class TestLibraryRobot:
     def test_robot_last(self, monkeypatch):
         # last 仿真：status 解析 + mtx load 最后一个非 IE 满槽
         c = lib([(0, MTX_STATUS_FULL, ""), (0, "", "")], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/robot/last")
+        r = c.post("/api/v1/libraries/sg1/robot/last?async=false")
         assert r.status_code == 200, r.text
         b = r.json()
         assert b["code"] == "LAST_SUCCESS"
@@ -78,16 +78,16 @@ class TestLibraryRobot:
 
     def test_robot_last_no_media(self, monkeypatch):
         c = lib([(0, "Storage Element 1:Empty:VolumeTag=\n", "")], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/robot/last")
+        r = c.post("/api/v1/libraries/sg1/robot/last?async=false")
         assert r.status_code in (404, 409, 400)
         assert r.json()["detail"]["code"] == "MEDIA_NOT_FOUND"
 
     def test_invalid_slot_rejected(self, monkeypatch):
         c = lib([], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1/exchange", json={"source": 0, "destination": 2, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1/exchange?async=false", json={"source": 0, "destination": 2, "confirm": True})
         assert r.status_code == 400
 
     def test_injection_rejected(self, monkeypatch):
         c = lib([], monkeypatch)
-        r = c.post("/api/v1/libraries/sg1;rm/robot/position", json={"element": 1, "confirm": True})
+        r = c.post("/api/v1/libraries/sg1;rm/robot/position?async=false", json={"element": 1, "confirm": True})
         assert r.status_code == 400

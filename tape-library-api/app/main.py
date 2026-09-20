@@ -1,4 +1,5 @@
 """FastAPI application entrypoint."""
+import os
 import sys
 from pathlib import Path
 
@@ -12,16 +13,16 @@ from app.audit.audit import AuditChain
 from app.audit.storage import AuditStorage
 from app.commands.runner import CommandRunner
 from app.config import settings
+from app.jobs import JobManager
 from app.models.common import fail
-
-
 def create_app(audit_dir=None, timeout=None, runner=None):
     app = FastAPI(
         title="Tape Library API",
-        version="1.0.0",
+        version="1.2.1",
         description="REST API for Linux Tape Library management: discovery, library/drive/media "
                     "operations, SCSI diagnostics, read/write tests, full audit trail. "
-                    "Safety model: LEVEL_1 read-only, LEVEL_2 device ops, LEVEL_3 write/erase.",
+                    "Safety model: LEVEL_1 read-only, LEVEL_2 device ops, LEVEL_3 write/erase. "
+                    "Long-running operations run as async jobs (202 + job_id, poll /api/v1/jobs/{id}).",
     )
     storage = AuditStorage(audit_dir or settings.audit_dir)
     chain = AuditChain(storage)
@@ -32,6 +33,8 @@ def create_app(audit_dir=None, timeout=None, runner=None):
         app.state.runner.audit = storage  # works for MockCommandRunner too
     except Exception:
         pass
+    app.state.jobs = JobManager(audit_dir or settings.audit_dir,
+                                runner=app.state.runner)
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
@@ -48,6 +51,21 @@ def create_app(audit_dir=None, timeout=None, runner=None):
             return exc
         return JSONResponse(status_code=500, content=fail("INTERNAL_ERROR", str(exc),
                                                           request_id=getattr(request.state, "request_id", "")).model_dump())
+
+    # ---- archive gateway (optional; disabled gracefully if PG unreachable) ----
+    app.state.gateway = None
+    if os.getenv("GATEWAY_ENABLED", "true").lower() == "true":
+        try:
+            from app.gateway import GatewayConfig, GatewayManager
+            from app.gateway.api import router as gateway_api_router
+            gw_cfg = GatewayConfig()
+            gw = GatewayManager(gw_cfg, runner=app.state.runner, chain=chain)
+            gw.start()
+            app.state.gateway = gw
+            app.include_router(gateway_api_router)
+        except Exception as e:  # PG down etc: keep the core API up
+            print("[gateway] startup failed, continuing without gateway:", e,
+                  file=sys.stderr)
 
     @app.get("/", tags=["Meta"])
     def root():

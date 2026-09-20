@@ -53,7 +53,7 @@ class TestScsiAPI:
 
     def test_reset(self, monkeypatch):
         c = make_client([(0, "", "")], monkeypatch, mode="FULL")
-        r = c.post("/api/v1/scsi/sg4/reset", json={"confirm": True})
+        r = c.post("/api/v1/scsi/sg4/reset?async=false", json={"confirm": True})
         b = r.json()
         assert r.status_code == 200 and b["code"] == "RESET_SUCCESS"
         argv, _ = c.app.state.runner.calls[-1]
@@ -61,7 +61,7 @@ class TestScsiAPI:
 
     def test_reset_requires_confirm(self, monkeypatch):
         c = make_client([(0, "", "")], monkeypatch, mode="FULL")
-        r = c.post("/api/v1/scsi/sg4/reset", json={"confirm": False})
+        r = c.post("/api/v1/scsi/sg4/reset?async=false", json={"confirm": False})
         assert r.status_code == 400
 
     def test_invalid_device_rejected(self, monkeypatch):

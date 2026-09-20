@@ -28,6 +28,8 @@ under a mounted FUSE filesystem.
 import contextlib
 import math
 import os
+import shlex
+import subprocess
 import threading
 import time
 
@@ -366,6 +368,7 @@ class LtfsBackend(_CmdMixin):
         self.mounter = mounter
         self.lease = lease
         self.dev = normalize_device(cfg.drive)
+        self._ltfs_dev_cache = None  # resolved sg node (LTFS requires sg, not st)
         self._session_lock = threading.RLock()  # serialize session transitions
 
     # ---------- helpers ----------
@@ -377,6 +380,46 @@ class LtfsBackend(_CmdMixin):
 
     def _mount_timeout(self):
         return int(getattr(self.cfg, "ltfs_mount_timeout_s", 300) or 300)
+
+    def _sg_dev(self):
+        """LTFS binaries must talk to the drive's SG node: the st driver
+        (nst*) does not pass through partition/attribute CDBs — mkltfs on an
+        st node reports success but writes an unreadable index (field-proven
+        on 118 / ULT3580-TD9). cfg.ltfs_device wins; else sysfs auto-detect
+        from the configured st drive; last resort the drive as-is."""
+        if self._ltfs_dev_cache:
+            return self._ltfs_dev_cache
+        dev = ""
+        if str(getattr(self.cfg, "ltfs_device", "") or "").strip():
+            dev = normalize_device(str(self.cfg.ltfs_device).strip())
+        else:
+            try:
+                link = "/sys/class/scsi_tape/%s/device/generic" % os.path.basename(self.dev)
+                dev = "/dev/" + os.path.basename(os.readlink(link))
+            except OSError:
+                dev = ""
+        if not dev:
+            dev = self.dev
+        self._ltfs_dev_cache = dev
+        return dev
+
+    @staticmethod
+    def _ltfs_procs(mp):
+        """pids of ltfs daemons bound to this mountpoint (light, no audit)."""
+        try:
+            out = subprocess.run(["pgrep", "-f", "ltfs %s" % mp],
+                                 capture_output=True, text=True, timeout=10)
+            return [int(x) for x in out.stdout.split()]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _log_tail(path, n=300):
+        try:
+            with open(path, "r", errors="replace") as f:
+                return f.read()[-n:]
+        except OSError:
+            return "(no log)"
 
     def _wait_mountstate(self, mp, want_mounted, timeout_s=None):
         deadline = time.time() + (timeout_s or self._mount_timeout())
@@ -417,20 +460,25 @@ class LtfsBackend(_CmdMixin):
             self.mounter.ensure_mounted(barcode)
             mp = self._mp(barcode)
             os.makedirs(mp, exist_ok=True)
-            argv = [self._bin("ltfs"), mp, "-o", "devname=" + self.dev]
+            dev = self._sg_dev()
+            argv = [self._bin("ltfs"), mp, "-o", "devname=" + dev]
             if self.cfg.ltfs_sync_policy == "keep_mounted":
                 # durable-enough index updates while the session stays open
                 argv += ["-o", "sync_type=close"]
-            # NOTE: no -f/-d flags — both force FUSE foreground (debug) mode and
-            # would block this exec; libfuse default daemonizes after mount
-            rec = self._exec(rid, argv, "GW_LTFS_MOUNT", "LEVEL_2",
-                             device=self.dev, timeout=self._mount_timeout())
-            self._must_pass(rec, "LTFS_MOUNT_FAILED",
-                            "ltfs mount failed: %s -> %s"
-                            % (rec["command"], (rec["stdout"] + rec["stderr"])[:300]))
+            # ltfs daemonizes on successful mount and keeps inherited fds open,
+            # so it must NOT run under captured pipes (the exec would block
+            # until unmount). Wrap with bash -c + file redirect: bash exits as
+            # soon as the ltfs parent daemonizes; daemon logs land in <mp>.log.
+            log = os.path.join(self.cfg.ltfs_mount_root, "%s.mount.log" % barcode)
+            cmdline = "%s >>%s 2>&1 </dev/null" % (
+                " ".join(shlex.quote(a) for a in argv), shlex.quote(log))
+            self._exec(rid, ["bash", "-c", cmdline], "GW_LTFS_MOUNT", "LEVEL_2",
+                       device=dev, timeout=self._mount_timeout())
+            # ground truth is the mountpoint state, not the wrapper exit code
             if not self._wait_mountstate(mp, True):
                 raise TapeError("LTFS_MOUNT_TIMEOUT",
-                                "%s not mounted after %ss" % (mp, self._mount_timeout()))
+                                "%s not mounted after %ss; ltfs log: %s"
+                                % (mp, self._mount_timeout(), self._log_tail(log)))
             self.lease.set_ltfs(barcode)
             return mp
 
@@ -457,8 +505,24 @@ class LtfsBackend(_CmdMixin):
             if not self._wait_mountstate(mp, False):
                 raise TapeError("LTFS_UMOUNT_TIMEOUT",
                                 "%s still mounted after %ss" % (mp, self._mount_timeout()))
+            self._wait_daemon_exit(mp)
             self.lease.clear_ltfs()
             return True
+
+    def _wait_daemon_exit(self, mp, wait_s=60):
+        """FUSE detaches before the ltfs daemon finishes flushing its index;
+        wait for the daemon to actually exit (it holds the drive reservation),
+        SIGKILL as a last resort after the grace window."""
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            if not self._ltfs_procs(mp):
+                return True
+            time.sleep(1)
+        if self._ltfs_procs(mp):
+            self._exec(self._open_op("ltfskill"),
+                       ["pkill", "-9", "-f", "ltfs %s" % mp],
+                       "GW_LTFS_KILL", "LEVEL_2", timeout=30)
+        return True
 
     def _session(self, barcode):
         """Ensure an open LTFS session for `barcode` (one drive -> one media).
@@ -530,10 +594,11 @@ class LtfsBackend(_CmdMixin):
         rid = self._open_op("mkltfs")
         with self.lease.exclusive("ltfs_mount"):
             self.mounter.ensure_mounted(barcode)
-            argv = [self._bin("mkltfs"), "-f", "-d", self.dev,
+            argv = [self._bin("mkltfs"), "-f", "-d", self._sg_dev(),
                     "-n", volume_name or barcode]
             rec = self._exec(rid, argv, "GW_LTFS_FORMAT", "LEVEL_3",
-                             device=self.dev, timeout=self._mount_timeout())
+                             device=self._sg_dev(),
+                             timeout=self._mount_timeout() * 3)
             self._must_pass(rec, "LTFS_FORMAT_FAILED",
                             "mkltfs failed: %s -> %s"
                             % (rec["command"], (rec["stdout"] + rec["stderr"])[:300]))
@@ -546,8 +611,8 @@ class LtfsBackend(_CmdMixin):
         rid = self._open_op("ltfsck")
         with self.lease.exclusive("ltfs_mount"):
             self.mounter.ensure_mounted(barcode)
-            rec = self._exec(rid, [self._bin("ltfsck"), "-v", self.dev],
-                             "GW_LTFS_CHECK", "LEVEL_2", device=self.dev,
+            rec = self._exec(rid, [self._bin("ltfsck"), self._sg_dev()],
+                             "GW_LTFS_CHECK", "LEVEL_2", device=self._sg_dev(),
                              timeout=self._mount_timeout())
         out = (rec["stdout"] + rec["stderr"]).strip()
         return {"barcode": barcode, "clean": rec["exit_code"] == 0,
@@ -565,6 +630,7 @@ class LtfsBackend(_CmdMixin):
             pass
         return {
             "ltfs_mounted": self.lease.ltfs_mounted,
+            "ltfs_device": self._sg_dev(),
             "mount_root": root,
             "bin_dir": self.cfg.ltfs_bin_dir,
             "sync_policy": self.cfg.ltfs_sync_policy,

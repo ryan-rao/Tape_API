@@ -142,6 +142,7 @@ class GwConfigBody(BaseModel):
     ltfs_bin_dir: str = None
     ltfs_sync_policy: str = None
     ltfs_mount_timeout_s: int = Field(default=None, ge=10, le=3600)
+    ltfs_device: str = None
     confirm: bool = False
     apply: bool = False  # true: 写完立即重启网关生效
 
@@ -218,6 +219,15 @@ def _validate_gw_config(values: dict) -> dict:
             if not isinstance(v, int) or isinstance(v, bool) or not (10 <= v <= 3600):
                 bad("ltfs_mount_timeout_s must be an int in 10..3600")
             out[k] = v
+        elif k == "ltfs_device":
+            # 空串=显式清除（回 sysfs 自动推导 sg 节点），非空=设备路径
+            if v in (None, "", "null"):
+                out[k] = ""
+            else:
+                try:
+                    out[k] = normalize_device(str(v))
+                except HTTPException:
+                    bad("ltfs_device invalid device: %s" % v)
         elif k == "trust_drive":
             # 空串=显式清除（自动模式），仍保留在文件层覆盖 env；非空=条码
             out[k] = "" if v in (None, "", "null") else str(v)[:64]

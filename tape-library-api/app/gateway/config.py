@@ -19,7 +19,7 @@ FILE_KEYS = (
     "drive", "changer", "dte_map", "auto_load", "trust_drive", "verify_write",
     "max_attempts", "redis_enabled",
     "preferred_format", "ltfs_mount_root", "ltfs_bin_dir", "ltfs_sync_policy",
-    "ltfs_mount_timeout_s",
+    "ltfs_mount_timeout_s", "ltfs_device",
 )
 
 
@@ -155,6 +155,9 @@ class GatewayConfig:
             self.ltfs_sync_policy = "unmount"
         self.ltfs_mount_timeout_s = _as_int(
             pick("ltfs_mount_timeout_s", "GATEWAY_LTFS_MOUNT_TIMEOUT_S", 300), 300)
+        # LTFS binaries must use the drive's SG node (st/nst does not pass
+        # partition/attribute CDBs); empty = sysfs auto-detect from drive
+        self.ltfs_device = str(pick("ltfs_device", "GATEWAY_LTFS_DEVICE", ""))
         # recall intelligence
         self.recall_hot_window_s = int(os.getenv("GATEWAY_RECALL_HOT_WINDOW_S", "60"))
         self.recall_hot_threshold = int(os.getenv("GATEWAY_RECALL_HOT_THRESHOLD", "3"))
@@ -199,6 +202,7 @@ class GatewayConfig:
             "ltfs_bin_dir": self.ltfs_bin_dir,
             "ltfs_sync_policy": self.ltfs_sync_policy,
             "ltfs_mount_timeout_s": self.ltfs_mount_timeout_s,
+            "ltfs_device": self.ltfs_device or None,
             "config_file": config_file_path(),
             "file_keys": sorted(k for k in self.file_cfg if k in FILE_KEYS),
             "sources": dict(self.sources),

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS file_meta (
     container_id UUID,
     media_barcode  TEXT,
     tape_block_index BIGINT,
+    ltfs_path    TEXT,
     error       TEXT,
     attempts    INT NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS container_meta (
     tape_block_index BIGINT,
     offset_in_tape  BIGINT,
     length_on_tape  BIGINT,
+    ltfs_path       TEXT,
     archive_sha256  CHAR(64),
     error       TEXT,
     attempts    INT NOT NULL DEFAULT 0,
@@ -73,6 +75,7 @@ CREATE TABLE IF NOT EXISTS tape_media (
     barcode     TEXT PRIMARY KEY,
     state       TEXT NOT NULL DEFAULT 'appendable'
                 CHECK (state IN ('unknown','scratch','appendable','full','faulted')),
+    format      TEXT NOT NULL DEFAULT 'raw' CHECK (format IN ('raw','ltfs')),
     capacity_bytes BIGINT NOT NULL DEFAULT 1224438927360,
     used_bytes  BIGINT NOT NULL DEFAULT 0,
     block_records INT NOT NULL DEFAULT 0,
@@ -146,11 +149,17 @@ CREATE INDEX IF NOT EXISTS idx_task_queue ON gw_task (kind, state, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_recall_heat ON recall_events (container_id, ts);
 """
 
-# online migration for pre-directory-tree deployments: add new columns to
-# an already-created partitioned file_meta (cascades to every partition).
+# online migration for pre-directory-tree / pre-LTFS deployments: add new
+# columns to already-created partitioned file_meta (cascades to every
+# partition) and tape_media/container_meta. New-column CREATE INDEX statements
+# (none so far) must stay BELOW these ALTERs.
 MIGRATION_SQL = """
 ALTER TABLE file_meta ADD COLUMN IF NOT EXISTS cache_rel_path TEXT;
 ALTER TABLE file_meta ADD COLUMN IF NOT EXISTS member_path TEXT;
+ALTER TABLE file_meta ADD COLUMN IF NOT EXISTS ltfs_path TEXT;
+ALTER TABLE container_meta ADD COLUMN IF NOT EXISTS ltfs_path TEXT;
+ALTER TABLE tape_media ADD COLUMN IF NOT EXISTS format TEXT
+    NOT NULL DEFAULT 'raw' CHECK (format IN ('raw','ltfs'));
 """
 
 
@@ -275,7 +284,7 @@ class MetadataDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("SELECT file_id, filename, size_bytes, sha256, state, storage, kind,"
                             " container_id, file_offset_in_container, media_barcode,"
-                            " tape_block_index, cache_path, cache_rel_path, member_path,"
+                            " tape_block_index, ltfs_path, cache_path, cache_rel_path, member_path,"
                             " error, created_at, archived_at"
                             " FROM file_meta "
                             "WHERE filename ILIKE %s ORDER BY created_at DESC LIMIT %s",
@@ -457,12 +466,12 @@ class MetadataDB:
                 return cur.fetchall()
 
     # ---------- tape media + blocks ----------
-    def tape_upsert(self, barcode, state="appendable"):
+    def tape_upsert(self, barcode, state="appendable", format="raw"):
         with self.conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO tape_media (barcode, state) VALUES (%s,%s) "
-                    "ON CONFLICT (barcode) DO NOTHING", (barcode, state))
+                    "INSERT INTO tape_media (barcode, state, format) VALUES (%s,%s,%s) "
+                    "ON CONFLICT (barcode) DO NOTHING", (barcode, state, format))
 
     def tape_get(self, barcode):
         with self.conn() as conn:
@@ -471,7 +480,8 @@ class MetadataDB:
                 return cur.fetchone()
 
     def tape_update(self, conn, barcode, used_bytes_delta=0, block_records_delta=0,
-                    last_filemark=None, state=None, bytes_written_delta=0):
+                    last_filemark=None, state=None, bytes_written_delta=0,
+                    format=None):
         sets = ["used_bytes = used_bytes + %s", "block_records = block_records + %s",
                 "bytes_written = bytes_written + %s", "updated_at = now()"]
         vals = [used_bytes_delta, block_records_delta, bytes_written_delta]
@@ -481,6 +491,9 @@ class MetadataDB:
         if state is not None:
             sets.append("state = %s")
             vals.append(state)
+        if format is not None:
+            sets.append("format = %s")
+            vals.append(format)
         vals.append(barcode)
         with conn.cursor() as cur:
             cur.execute("UPDATE tape_media SET %s WHERE barcode = %%s" % ", ".join(sets), vals)
@@ -519,10 +532,12 @@ class MetadataDB:
                             "ORDER BY written_at DESC LIMIT 1", (_uuid(object_id),))
                 return cur.fetchone()
 
-    def file_set_tape_location(self, conn, file_id, barcode, block_index):
+    def file_set_tape_location(self, conn, file_id, barcode, block_index,
+                                ltfs_path=None):
         with conn.cursor() as cur:
-            cur.execute("UPDATE file_meta SET media_barcode=%s, tape_block_index=%s "
-                        "WHERE file_id=%s", (barcode, block_index, _uuid(file_id)))
+            cur.execute("UPDATE file_meta SET media_barcode=%s, tape_block_index=%s, "
+                        "ltfs_path=%s WHERE file_id=%s",
+                        (barcode, block_index, ltfs_path, _uuid(file_id)))
 
     def self_heal_states(self):
         """Restart recovery for DB-side states. Returns count of requeued items.
@@ -733,14 +748,14 @@ class MetadataDB:
                 cur.execute(
                     "SELECT file_id, filename, size_bytes, sha256, kind, state, storage, "
                     "cache_path, cache_rel_path, member_path, file_offset_in_container, "
-                    "container_id, media_barcode, tape_block_index, error, created_at, "
+                    "container_id, media_barcode, tape_block_index, ltfs_path, error, created_at, "
                     "archived_at, last_access_at "
                     "FROM file_meta ORDER BY created_at DESC LIMIT %s", (file_limit,))
                 files = cur.fetchall()
                 cur.execute(
                     "SELECT container_id, state, size_bytes, file_count, media_barcode, "
-                    "tape_block_index, offset_in_tape, length_on_tape, archive_sha256, "
-                    "error, created_at, archived_at FROM container_meta")
+                    "tape_block_index, offset_in_tape, length_on_tape, ltfs_path, "
+                    "archive_sha256, error, created_at, archived_at FROM container_meta")
                 containers = cur.fetchall()
                 cur.execute(
                     "SELECT media_barcode, block_index, object_id, object_type, "
@@ -748,7 +763,7 @@ class MetadataDB:
                     "ORDER BY block_index, offset_in_block")
                 blocks = cur.fetchall()
                 cur.execute(
-                    "SELECT barcode, state, capacity_bytes, used_bytes, block_records, "
+                    "SELECT barcode, state, format, capacity_bytes, used_bytes, block_records, "
                     "last_filemark, mount_count, bytes_written FROM tape_media ORDER BY barcode")
                 media = cur.fetchall()
                 cur.execute(

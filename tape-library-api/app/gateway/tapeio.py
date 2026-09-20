@@ -417,10 +417,12 @@ class LtfsBackend(_CmdMixin):
             self.mounter.ensure_mounted(barcode)
             mp = self._mp(barcode)
             os.makedirs(mp, exist_ok=True)
-            argv = [self._bin("ltfs"), mp, "-o", "devname=" + self.dev, "-d"]
+            argv = [self._bin("ltfs"), mp, "-o", "devname=" + self.dev]
             if self.cfg.ltfs_sync_policy == "keep_mounted":
                 # durable-enough index updates while the session stays open
-                argv[-1:] = ["-o", "sync_type=close", "-d"]
+                argv += ["-o", "sync_type=close"]
+            # NOTE: no -f/-d flags — both force FUSE foreground (debug) mode and
+            # would block this exec; libfuse default daemonizes after mount
             rec = self._exec(rid, argv, "GW_LTFS_MOUNT", "LEVEL_2",
                              device=self.dev, timeout=self._mount_timeout())
             self._must_pass(rec, "LTFS_MOUNT_FAILED",

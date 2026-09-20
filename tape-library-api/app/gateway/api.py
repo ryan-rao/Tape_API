@@ -936,8 +936,7 @@ def gw_media_format(request: Request, barcode: str, body: MediaFormatBody):
                            % (barcode, used_blocks, int(m.get("used_bytes") or 0))})
         res = gw.tape.backends["ltfs"].format_media(barcode)
         with gw.db.conn() as conn:
-            gw.db.tape_update(conn, barcode, state="appendable", format="ltfs",
-                              last_filemark=0)
+            gw.db.tape_format_reset(conn, barcode, "ltfs")
         return ok({"barcode": barcode, "format": "ltfs", "state": "appendable",
                    "erased_media": barcode, "mkltfs": res["output"]},
                   code="MEDIA_FORMATTED", request_id=request.state.request_id)

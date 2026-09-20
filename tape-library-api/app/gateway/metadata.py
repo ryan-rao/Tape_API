@@ -498,6 +498,15 @@ class MetadataDB:
         with conn.cursor() as cur:
             cur.execute("UPDATE tape_media SET %s WHERE barcode = %%s" % ", ".join(sets), vals)
 
+    def tape_format_reset(self, conn, barcode, format):
+        """Reset the ledger for a freshly formatted medium (mkltfs erases all
+        prior data): counters back to zero, format switched, appendable."""
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tape_media SET state='appendable', format=%s, used_bytes=0, "
+                "block_records=0, bytes_written=0, last_filemark=0, updated_at=now() "
+                "WHERE barcode=%s", (format, barcode))
+
     def tape_media_mounted(self, barcode):
         with self.conn() as conn:
             with conn.cursor() as cur:

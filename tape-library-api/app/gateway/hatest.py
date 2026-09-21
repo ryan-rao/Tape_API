@@ -85,6 +85,7 @@ api() { # api METHOD PATH OUTFILE(空=收 body) [curl_extra...]
 TASK_STATE=""; TASK_S=0
 task_wait() { # task_wait <task_id> —— 轮询至终态；产出 TASK_STATE / TASK_S(秒)
   local tid="$1" t0=$(date +%s.%N) n=0
+  [ -n "$tid" ] || { TASK_STATE=invalid_empty_id; return 1; }
   TASK_STATE=""; TASK_S=0
   while :; do
     api GET "/archive/tasks/$tid" '' || return 1
@@ -98,6 +99,7 @@ task_wait() { # task_wait <task_id> —— 轮询至终态；产出 TASK_STATE /
 JOB_STATE=""; JOB_S=0
 job_wait() { # job_wait <job_id> —— recall 冷路径异步 job 轮询（/api/v1/jobs）
   local jid="$1" t0=$(date +%s.%N) n=0
+  [ -n "$jid" ] || { JOB_STATE=invalid_empty_id; return 1; }
   JOB_STATE=""; JOB_S=0
   while :; do
     api GET "/jobs/$jid" '' || return 1
@@ -106,6 +108,32 @@ job_wait() { # job_wait <job_id> —— recall 冷路径异步 job 轮询（/api
     sleep 2; n=$((n+2)); [ "$n" -gt 7200 ] && { JOB_STATE=timeout; break; }
   done
   JOB_S=$("$PY" -c "print(round($(date +%s.%N)-$t0,2))" 2>/dev/null || echo 0)
+}
+
+FW_STATE=""; FW_S=0
+file_wait_archived() { # file_wait_archived <file_id> —— 轮询文件终态（覆盖 CONTAINER_SEALED 无任务信封）
+  local fid="$1" t0=$(date +%s.%N) n=0
+  FW_STATE=""; FW_S=0
+  while :; do
+    api GET "/archive/files/$fid" '' || return 1
+    FW_STATE=$(jget "$BODY" data.state)
+    case "$FW_STATE" in archived|failed) break ;; esac
+    sleep 2; n=$((n+2)); [ "$n" -gt 7200 ] && { FW_STATE=timeout; break; }
+  done
+  FW_S=$("$PY" -c "print(round($(date +%s.%N)-$t0,2))" 2>/dev/null || echo 0)
+}
+
+arch_one() { # arch_one <file_id> —— 请求归档并等文件终态；已随容器连带归档则跳过
+  local f="$1" pre c
+  api GET "/archive/files/$f" '' || return 1
+  pre=$(jget "$BODY" data.state)
+  if [ "$pre" = archived ]; then log "文件 ${f:0:8} 已随容器归档，跳过"; FW_S=0; return 0; fi
+  api POST "/archive/files/$f/archive" '' || return 1
+  c=$(jget "$BODY" data.container_id); [ -n "$c" ] && cid="$c"
+  log "归档请求: ${f:0:8} route=$(jget "$BODY" data.route) code=$(jget "$BODY" code)"
+  file_wait_archived "$f" || return 1
+  [ "$FW_STATE" = archived ] || { log "归档未完成: ${f:0:8} -> $FW_STATE"; return 1; }
+  return 0
 }
 
 media_probe() { # media_probe <barcode> —— 产出 MU_USED MU_CAP MU_STATE
@@ -198,19 +226,14 @@ round_one() { # round_one <drive> <tape> <round> —— 一轮全链；emit roun
   api POST "/archive/upload" '' -F "file=@$s2" || return 1; f2=$(jget "$BODY" data.file_id)
   [ -n "$f1" ] && [ -n "$f2" ] || { log "上传 small 无 file_id"; return 1; }
   log "上传 ok: big=$fid(${up_ms}ms) s=$f1,$f2"
-  api POST "/archive/files/$fid/archive" '' || return 1
-  tid=$(jget "$BODY" data.task_id); cid=$(jget "$BODY" data.container_id)
-  task_wait "$tid" || return 1
-  [ "$TASK_STATE" = succeeded ] || { log "归档 big 失败: $TASK_STATE ${BODY:0:160}"; return 1; }
-  arc_s=$TASK_S
+  cid=""
+  arch_one "$fid" || return 1
+  arc_s=$FW_S
   for f in "$f1" "$f2"; do
-    api POST "/archive/files/$f/archive" '' || return 1
-    tid=$(jget "$BODY" data.task_id); [ -n "$cid" ] || cid=$(jget "$BODY" data.container_id)
-    task_wait "$tid" || return 1
-    [ "$TASK_STATE" = succeeded ] || { log "归档 small 失败"; return 1; }
-    arcsm_s=$(awk -v a="$arcsm_s" -v b="$TASK_S" 'BEGIN{printf "%.2f", a+b}')
+    arch_one "$f" || return 1
+    arcsm_s=$(awk -v a="$arcsm_s" -v b="$FW_S" 'BEGIN{printf "%.2f", a+b}')
   done
-  log "归档 ok: big=${arc_s}s smalls=${arcsm_s}s cid=$cid"
+  log "归档 ok: big(${arc_s}s) smalls(${arcsm_s}s) cid=$cid"
   cache_clear "$cid"
   api POST "/archive/files/$fid/recall" '' || return 1
   tid=$(jget "$BODY" data.job_id)

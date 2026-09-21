@@ -156,7 +156,8 @@ cache_clear() { # cache_clear <container_ids 空格分隔> —— 清自有缓�
   api GET "/archive/cache?limit=1000" '' || true
   cache_dir=$(jget "$BODY" data.config.cache_dir)
   [ -n "$cache_dir" ] && [ -d "$cache_dir" ] || return 0
-  find "$cache_dir" -type f -name 'hatest-*' -delete 2>/dev/null
+  # 缓存文件名带哈希前缀（如 4c0d0c5c90d3_hatest-*.bin），必须用 *hatest-* 通配
+  find "$cache_dir" -type f -name '*hatest-*' -delete 2>/dev/null
   for cid in $cids; do
     [ -n "$cid" ] || continue
     find "$cache_dir" -type f -name "*${cid}*" -delete 2>/dev/null

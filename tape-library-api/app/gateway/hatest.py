@@ -30,8 +30,10 @@ DEFAULT_SCRIPT = r'''#!/usr/bin/env bash
 set -u
 API="${HATEST_API:-http://127.0.0.1:8001/api/v1}"
 ROUNDS="${HATEST_ROUNDS:-0}"
-BIG_MB="${HATEST_BIG_MB:-256}"
+BIG_MB="${HATEST_BIG_MB:-100}"
+BIG_COUNT="${HATEST_BIG_COUNT:-10}"
 SMALL_MB="${HATEST_SMALL_MB:-1}"
+SMALL_COUNT="${HATEST_SMALL_COUNT:-0}"
 FILL="${HATEST_FILL:-1}"
 BASE="${HATEST_BASE:-/home/tape_api/hatest}"
 MET="$BASE/metrics.jsonl"
@@ -201,63 +203,83 @@ except Exception: print(1)' "$dmap" 2>/dev/null || echo 1)
     [ -n "$TAPECSV" ] && PREF=$alt
   fi
   [ -n "$PREF" ] || PREF=raw
-  log "计划: drives=$ND tapes=[$TAPECSV] format=$PREF rounds=$ROUNDS big=${BIG_MB}MB small=${SMALL_MB}MB fill=$FILL"
-  emit "{\"event\":\"setup\",\"ts\":$(ts_ms),\"api\":\"$API\",\"drives\":$ND,\"tapes\":\"$TAPECSV\",\"format\":\"$PREF\",\"rounds\":$ROUNDS,\"big_mb\":$BIG_MB,\"small_mb\":$SMALL_MB,\"fill\":$FILL}"
+  log "计划: drives=$ND tapes=[$TAPECSV] format=$PREF rounds=$ROUNDS big=${BIG_COUNT}x${BIG_MB}MB smalls=${SMALL_COUNT}x${SMALL_MB}MB fill=$FILL"
+  emit "{\"event\":\"setup\",\"ts\":$(ts_ms),\"api\":\"$API\",\"drives\":$ND,\"tapes\":\"$TAPECSV\",\"format\":\"$PREF\",\"rounds\":$ROUNDS,\"big_mb\":$BIG_MB,\"big_count\":$BIG_COUNT,\"small_mb\":$SMALL_MB,\"small_count\":$SMALL_COUNT,\"fill\":$FILL}"
 }
 
-round_one() { # round_one <drive> <tape> <round> —— 一轮全链；emit round 事件
-  local d="$1" tape="$2" r="$3" dir tag big s1 s2 sha_big sha_dl
-  local fid f1 f2 tid cid up_ms=0 arc_s=0 arcsm_s=0 rec_s=0 dl_ms=0
-  local created=0 downloaded=0 verify=PASS
+round_one() { # round_one <drive> <tape> <round> —— 一轮全链：N×big 批量上传/归档 + 逐件冷召回校验；emit round 事件
+  local d="$1" tape="$2" r="$3" dir tag f i t0 tid cid sha_dl
+  local up_ms=0 arc_s=0 arcsm_s=0 rec_s=0 dl_ms=0 created=0 downloaded=0 verify=PASS
+  local -a files=() shas=() fids=() sfiles=() sshas=() sfids=()
   dir="$WORK/d$d/$tape/r$r"; mkdir -p "$dir"
   tag="hatest-d${d}-r${r}-$(date +%s)"
-  big="$dir/${tag}-big.bin"; s1="$dir/${tag}-s1.bin"; s2="$dir/${tag}-s2.bin"
   local wall0=$(date +%s.%N)
-  log "---- round=$r drive=$d tape=$tape ----"
-  dd if=/dev/urandom of="$big" bs=1M count="$BIG_MB" 2>/dev/null || return 1
-  dd if=/dev/urandom of="$s1" bs=1M count="$SMALL_MB" 2>/dev/null || return 1
-  dd if=/dev/urandom of="$s2" bs=1M count="$SMALL_MB" 2>/dev/null || return 1
-  sha_big=$(sha256sum "$big" | cut -d' ' -f1)
-  created=$(( created + $(stat -c%s "$big") + $(stat -c%s "$s1") + $(stat -c%s "$s2") ))
-  local t0=$(ts_ms)
-  api POST "/archive/upload" '' -F "file=@$big" || { log "上传 big 失败 rc=$RC"; return 1; }
-  up_ms=$(( $(ts_ms) - t0 )); fid=$(jget "$BODY" data.file_id)
-  [ -n "$fid" ] || { log "上传 big 无 file_id: ${BODY:0:200}"; return 1; }
-  api POST "/archive/upload" '' -F "file=@$s1" || return 1; f1=$(jget "$BODY" data.file_id)
-  api POST "/archive/upload" '' -F "file=@$s2" || return 1; f2=$(jget "$BODY" data.file_id)
-  [ -n "$f1" ] && [ -n "$f2" ] || { log "上传 small 无 file_id"; return 1; }
-  log "上传 ok: big=$fid(${up_ms}ms) s=$f1,$f2"
+  log "---- round=$r drive=$d tape=$tape files=${BIG_COUNT}x${BIG_MB}MB smalls=${SMALL_COUNT} ----"
+  for ((i=1; i<=BIG_COUNT; i++)); do
+    f="$dir/${tag}-b${i}.bin"
+    dd if=/dev/urandom of="$f" bs=1M count="$BIG_MB" 2>/dev/null || return 1
+    shas[i]=$(sha256sum "$f" | cut -d' ' -f1); files[i]="$f"
+    created=$(( created + $(stat -c%s "$f") ))
+  done
+  for ((i=1; i<=SMALL_COUNT; i++)); do
+    f="$dir/${tag}-s${i}.bin"
+    dd if=/dev/urandom of="$f" bs=1M count="$SMALL_MB" 2>/dev/null || return 1
+    sshas[i]=$(sha256sum "$f" | cut -d' ' -f1); sfiles[i]="$f"
+    created=$(( created + $(stat -c%s "$f") ))
+  done
   cid=""
-  arch_one "$fid" || return 1
-  arc_s=$FW_S
-  for f in "$f1" "$f2"; do
-    arch_one "$f" || return 1
+  for ((i=1; i<=BIG_COUNT; i++)); do
+    t0=$(ts_ms)
+    api POST "/archive/upload" '' -F "file=@${files[i]}" || { log "上传 b$i 失败 rc=$RC"; return 1; }
+    up_ms=$(( up_ms + $(ts_ms) - t0 ))
+    fids[i]=$(jget "$BODY" data.file_id)
+    [ -n "${fids[i]}" ] || { log "上传 b$i 无 file_id: ${BODY:0:200}"; return 1; }
+  done
+  for ((i=1; i<=SMALL_COUNT; i++)); do
+    api POST "/archive/upload" '' -F "file=@${sfiles[i]}" || return 1
+    sfids[i]=$(jget "$BODY" data.file_id)
+    [ -n "${sfids[i]}" ] || { log "上传 s$i 无 file_id"; return 1; }
+  done
+  log "上传 ok: big=${BIG_COUNT}x${BIG_MB}MB(${up_ms}ms) smalls=${SMALL_COUNT}"
+  for ((i=1; i<=BIG_COUNT; i++)); do
+    arch_one "${fids[i]}" || return 1
+    arc_s=$(awk -v a="$arc_s" -v b="$FW_S" 'BEGIN{printf "%.2f", a+b}')
+  done
+  for ((i=1; i<=SMALL_COUNT; i++)); do
+    arch_one "${sfids[i]}" || return 1
     arcsm_s=$(awk -v a="$arcsm_s" -v b="$FW_S" 'BEGIN{printf "%.2f", a+b}')
   done
-  log "归档 ok: big(${arc_s}s) smalls(${arcsm_s}s) cid=$cid"
-  cache_clear "$cid"
-  api POST "/archive/files/$fid/recall" '' || return 1
-  tid=$(jget "$BODY" data.job_id)
-  if [ -n "$tid" ]; then
-    job_wait "$tid" || return 1
-    [ "$JOB_STATE" = succeeded ] || { log "召回失败: $JOB_STATE"; return 1; }
-    rec_s=$JOB_S
-  else
-    rec_s=0; log "召回立即返回（温路径: $(jget "$BODY" code)）"
-  fi
-  t0=$(ts_ms)
-  api GET "/archive/files/$fid/download" "$dir/dl-big.bin" || return 1
-  dl_ms=$(( $(ts_ms) - t0 ))
-  downloaded=$(stat -c%s "$dir/dl-big.bin" 2>/dev/null || echo 0)
-  cache_clear "$cid"
-  sha_dl=$(sha256sum "$dir/dl-big.bin" 2>/dev/null | cut -d' ' -f1)
-  [ "$sha_dl" = "$sha_big" ] || verify=FAIL
-  for f in "$fid" "$f1" "$f2"; do api DELETE "/archive/files/$f" '' || log "删除 $f rc=$RC"; done
+  log "归档 ok: ${BIG_COUNT}xbig(${arc_s}s) smalls(${arcsm_s}s) cid=$cid"
+  # 逐件召回校验：每件召回前清缓存保证冷读；recall→download→sha256→删本地
+  for ((i=1; i<=BIG_COUNT; i++)); do
+    cache_clear "$cid"
+    api POST "/archive/files/${fids[i]}/recall" '' || return 1
+    tid=$(jget "$BODY" data.job_id)
+    if [ -n "$tid" ]; then
+      job_wait "$tid" || return 1
+      [ "$JOB_STATE" = succeeded ] || { log "召回 b$i 失败: $JOB_STATE"; return 1; }
+      rec_s=$(awk -v a="$rec_s" -v b="$JOB_S" 'BEGIN{printf "%.2f", a+b}')
+    else
+      log "召回 b$i 立即返回（温路径: $(jget "$BODY" code)）"
+    fi
+    t0=$(ts_ms)
+    api GET "/archive/files/${fids[i]}/download" "$dir/dl-b${i}.bin" || return 1
+    dl_ms=$(( dl_ms + $(ts_ms) - t0 ))
+    downloaded=$(( downloaded + $(stat -c%s "$dir/dl-b${i}.bin" 2>/dev/null || echo 0) ))
+    sha_dl=$(sha256sum "$dir/dl-b${i}.bin" 2>/dev/null | cut -d' ' -f1)
+    if [ "$sha_dl" = "${shas[i]}" ]; then log "召回校验 b$i/$BIG_COUNT: PASS rec累计=${rec_s}s"
+    else verify=FAIL; log "召回校验 b$i/$BIG_COUNT: FAIL"; fi
+    rm -f "$dir/dl-b${i}.bin"
+  done
+  for ((i=1; i<=SMALL_COUNT; i++)); do api DELETE "/archive/files/${sfids[i]}" '' || log "删除 s$i rc=$RC"; done
+  for ((i=1; i<=BIG_COUNT; i++)); do api DELETE "/archive/files/${fids[i]}" '' || log "删除 b$i rc=$RC"; done
   rm -rf "$dir"
   media_probe "$tape"
   local wall=$("$PY" -c "print(round($(date +%s.%N)-$wall0,2))" 2>/dev/null || echo 0)
-  emit "{\"event\":\"round\",\"ts\":$(ts_ms),\"drive\":$d,\"tape\":\"$tape\",\"round\":$r,\"api_ms\":{\"upload\":$up_ms,\"download\":$dl_ms},\"task_s\":{\"archive\":$arc_s,\"archive_small\":$arcsm_s,\"recall\":$rec_s},\"bytes\":{\"created\":$created,\"downloaded\":$downloaded},\"verify\":\"$verify\",\"cache_pct\":$CACHE_PCT,\"media_used_bytes\":$MU_USED,\"media_capacity_bytes\":$MU_CAP,\"wall_s\":$wall}"
-  log "round=$r verify=$verify up=${up_ms}ms dl=${dl_ms}ms arc=${arc_s}s rec=${rec_s}s bytes=$created cache=${CACHE_PCT}% used=$MU_USED"
+  local up_avg=0 dl_avg=0
+  up_avg=$(( up_ms / BIG_COUNT )); dl_avg=$(( dl_ms / BIG_COUNT ))
+  emit "{\"event\":\"round\",\"ts\":$(ts_ms),\"drive\":$d,\"tape\":\"$tape\",\"round\":$r,\"files\":$BIG_COUNT,\"api_ms\":{\"upload\":$up_avg,\"download\":$dl_avg},\"task_s\":{\"archive\":$arc_s,\"archive_small\":$arcsm_s,\"recall\":$rec_s},\"bytes\":{\"created\":$created,\"downloaded\":$downloaded},\"verify\":\"$verify\",\"cache_pct\":$CACHE_PCT,\"media_used_bytes\":$MU_USED,\"media_capacity_bytes\":$MU_CAP,\"wall_s\":$wall}"
+  log "round=$r verify=$verify files=$BIG_COUNT up_avg=${up_avg}ms dl_avg=${dl_avg}ms arc=${arc_s}s rec=${rec_s}s bytes=$created cache=${CACHE_PCT}% used=$MU_USED"
   [ "$verify" = PASS ]
 }
 
@@ -286,7 +308,7 @@ worker() {
 }
 
 main() {
-  log "== HATest 开始: api=$API rounds=$ROUNDS big=${BIG_MB}MB small=${SMALL_MB}MB fill=$FILL =="
+  log "== HATest 开始: api=$API rounds=$ROUNDS big=${BIG_COUNT}x${BIG_MB}MB smalls=${SMALL_COUNT}x${SMALL_MB}MB fill=$FILL =="
   setup || { emit "{\"event\":\"error\",\"ts\":$(ts_ms),\"msg\":\"setup_failed\"}"; exit 1; }
   if [ -z "$TAPECSV" ]; then
     log "无可写介质（format=$PREF, state=appendable/scratch）"
@@ -311,7 +333,8 @@ main "$@"
 '''
 
 _PARAM_LIMITS = {"rounds": (0, 100000), "big_mb": (1, 16384),
-                 "small_mb": (1, 1024), "fill": (0, 1)}
+                 "big_count": (1, 1000), "small_mb": (1, 1024),
+                 "small_count": (0, 1000), "fill": (0, 1)}
 
 
 class HATestRunner:
@@ -355,7 +378,8 @@ class HATestRunner:
             raise HATestError("HATEST_RUNNING",
                               "a HATest run is already active (pid %d)" % self._pid())
         p = {"api": "http://127.0.0.1:8001/api/v1", "rounds": 0,
-             "big_mb": 256, "small_mb": 1, "fill": 1}
+             "big_mb": 100, "big_count": 10, "small_mb": 1,
+             "small_count": 0, "fill": 1}
         p.update(params or {})
         if not str(p["api"]).startswith(("http://", "https://")):
             raise HATestError("HATEST_BAD_PARAM", "api must be http(s) url")
@@ -379,7 +403,8 @@ class HATestRunner:
         if os.path.exists(met):
             os.replace(met, met + ".%d.old" % int(time.time()))
         exports = "".join("export HATEST_%s='%s'\n" % (k.upper(), p[k])
-                           for k in ("api", "rounds", "big_mb", "small_mb", "fill"))
+                           for k in ("api", "rounds", "big_mb", "big_count",
+                                     "small_mb", "small_count", "fill"))
         exports += "export HATEST_BASE='%s'\n" % self.base
         if body.startswith("#!"):
             body = body.split("\n", 1)[1] if "\n" in body else ""

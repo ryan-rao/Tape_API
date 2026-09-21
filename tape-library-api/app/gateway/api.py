@@ -832,6 +832,110 @@ def gw_tree(request: Request):
         raise _http(e)
 
 
+# ---------- archive dirtree（归档目录树：纯元数据） ----------
+@router.get("/dirtree")
+def gw_dirtree(request: Request):
+    """归档目录树：从元数据库构建客户目录结构，纯元数据不扫盘。
+
+    每个文件节点带磁带落位：
+    - 小文件(kind=container_member)：聚合进容器，落位 = 容器ID + 容器内偏移
+      + 容器所在磁带条码 + 磁带块号；
+    - 大文件(kind=file 直写)：落位 = 磁带条码 + 磁带块号（独立块）；
+    - LTFS 文件另带 ltfs_path。
+    缓存已淘汰的文件仍在树上（数据来源是 file_meta 而非磁盘）。"""
+    require_level("LEVEL_1")
+    gw = _gw(request)
+    try:
+        files, containers, _blocks, media, recalls = gw.db.tree_index(
+            file_limit=20000)
+        c_by_id = {str(c["container_id"]): c for c in containers}
+        media_by_bc = {m["barcode"]: dict(m) for m in media}
+        recall_by_fid = {str(r["file_id"]): int(r["n"]) for r in recalls}
+
+        def _f_view(f):
+            fid = str(f["file_id"])
+            kind = f.get("kind") or "file"
+            c = c_by_id.get(str(f["container_id"])) if f.get("container_id") else None
+            mbc = (c or {}).get("media_barcode") or f.get("media_barcode")
+            tbi = f.get("tape_block_index") or (c or {}).get("tape_block_index")
+            bc = media_by_bc.get(mbc) or {}
+            return {
+                "file_id": fid, "filename": f["filename"],
+                "size_bytes": f["size_bytes"], "sha256": f.get("sha256"),
+                "kind": kind, "state": f["state"], "storage": f.get("storage"),
+                "container_id": str(f["container_id"]) if f.get("container_id") else None,
+                "container_state": (c or {}).get("state"),
+                "container_size_bytes": (c or {}).get("size_bytes"),
+                "container_file_count": (c or {}).get("file_count"),
+                "offset_in_container": f.get("file_offset_in_container"),
+                "media_barcode": mbc, "tape_block_index": tbi,
+                "tape_format": bc.get("format") or "raw",
+                "ltfs_path": f.get("ltfs_path"),
+                "recalls": recall_by_fid.get(fid, 0),
+                "archived_at": f.get("archived_at"),
+                "created_at": f.get("created_at"),
+            }
+
+        root = {"name": "archived", "type": "dir", "path": "",
+                "children": [], "file_count": 0, "size_bytes": 0}
+        dir_nodes = {"": root}
+
+        def dir_node(rel):
+            if rel in dir_nodes:
+                return dir_nodes[rel]
+            parent_rel, _, name = rel.rpartition("/")
+            parent = dir_node(parent_rel)
+            node = {"name": name, "type": "dir", "path": rel,
+                    "children": [], "file_count": 0, "size_bytes": 0}
+            parent["children"].append(node)
+            dir_nodes[rel] = node
+            return node
+
+        for f in sorted(files, key=lambda x: str(x.get("created_at") or "")):
+            path = (f.get("member_path") or f.get("ltfs_path")
+                    or f.get("filename") or "unknown").lstrip("/")
+            drel, _, name = path.rpartition("/")
+            node = dir_node(drel)
+            node["children"].append({
+                "type": "file", "name": name, "path": path, "file": _f_view(f)})
+
+        def _roll(n):
+            if n["type"] == "file":
+                return int(n["file"]["size_bytes"] or 0), 1
+            size, cnt = 0, 0
+            for ch in n["children"]:
+                s, k = _roll(ch)
+                size += s
+                cnt += k
+            n["size_bytes"] = size
+            n["file_count"] = cnt
+            n["children"].sort(key=lambda c: (c["type"] != "dir", c["name"]))
+            return size, cnt
+        _roll(root)
+
+        kinds, states = {}, {}
+        for f in files:
+            k = f.get("kind") or "file"
+            kinds[k] = kinds.get(k, 0) + 1
+            states[f["state"]] = states.get(f["state"], 0) + 1
+        summary = {
+            "files_total": len(files),
+            "small_aggregated": kinds.get("container_member", 0),
+            "large_direct": kinds.get("file", 0),
+            "by_state": states,
+            "containers_total": len(containers),
+            "tapes": [{"barcode": m["barcode"], "format": m.get("format") or "raw",
+                       "used_bytes": m.get("used_bytes"),
+                       "block_records": m.get("block_records")} for m in media],
+            "small_file_mb": gw.cfg.small_file_mb,
+        }
+        return ok({"root": root, "summary": summary,
+                   "truncated": len(files) >= 20000},
+                  request_id=request.state.request_id)
+    except GatewayError as e:
+        raise _http(e)
+
+
 # ---------- containers ----------
 @router.get("/containers")
 def gw_containers(request: Request, state: str = None,

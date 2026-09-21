@@ -139,6 +139,16 @@ cache_clear() { # cache_clear <container_ids 空格分隔> —— 清自有缓�
   CACHE_PCT=$("$PY" -c "q=int('${quota:-0}' or 0);t=int('${tot:-0}' or 0);print(round(t*100.0/q,1) if q else 0.0)" 2>/dev/null || echo 0)
 }
 
+tape_pick() { # tape_pick <format> —— 按格式列出可写介质条码（读 $BODY）
+  printf '%s' "$BODY" | "$PY" -c '
+import json,sys
+try: items=json.loads(sys.stdin.read() or "{}")["data"]["items"]
+except Exception: items=[]
+print(" ".join(m["barcode"] for m in items
+               if m.get("format","raw")==sys.argv[1]
+               and m.get("state") in ("appendable","scratch")))' "$1" 2>/dev/null
+}
+
 ND=1; TAPECSV=""; PREF="raw"
 setup() {
   log "== HATest setup =="
@@ -147,19 +157,21 @@ setup() {
   api GET "/libraries" '' || true
   log "libraries: ${BODY:0:300}"
   api GET "/archive/gw-config" '' || true
-  PREF=$(jget "$BODY" data.running.preferred_format); [ -n "$PREF" ] || PREF=raw
-  local dmap; dmap=$(jget "$BODY" data.running.dte_map)
+  # 实测：preferred_format/dte_map 在 data.live.*（running 是布尔标志）
+  PREF=$(jget "$BODY" data.live.preferred_format)
+  local dmap; dmap=$(jget "$BODY" data.live.dte_map)
   ND=$("$PY" -c 'import json,sys
 try: d=json.loads(sys.argv[1] or "{}"); print(max(1,len(d)))
 except Exception: print(1)' "$dmap" 2>/dev/null || echo 1)
   api GET "/archive/media" '' || true
-  TAPECSV=$("$PY" -c '
-import json,sys
-try: items=json.loads(sys.argv[1] or "{}")["data"]["items"]
-except Exception: items=[]
-print(" ".join(m["barcode"] for m in items
-               if m.get("format","raw")==sys.argv[2]
-               and m.get("state") in ("appendable","scratch")))' "$BODY" "$PREF" 2>/dev/null)
+  TAPECSV=$(tape_pick "$PREF")
+  # 兜底：preferred_format 缺失/无匹配时，尝试另一格式的可写介质（按介质推断）
+  if [ -z "$TAPECSV" ]; then
+    local alt; [ "$PREF" = ltfs ] && alt=raw || alt=ltfs
+    TAPECSV=$(tape_pick "$alt")
+    [ -n "$TAPECSV" ] && PREF=$alt
+  fi
+  [ -n "$PREF" ] || PREF=raw
   log "计划: drives=$ND tapes=[$TAPECSV] format=$PREF rounds=$ROUNDS big=${BIG_MB}MB small=${SMALL_MB}MB fill=$FILL"
   emit "{\"event\":\"setup\",\"ts\":$(ts_ms),\"api\":\"$API\",\"drives\":$ND,\"tapes\":\"$TAPECSV\",\"format\":\"$PREF\",\"rounds\":$ROUNDS,\"big_mb\":$BIG_MB,\"small_mb\":$SMALL_MB,\"fill\":$FILL}"
 }

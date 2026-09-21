@@ -1,4 +1,4 @@
-"""HATest playground — gateway 性能/高可用压测控制器（v1.4.0）。
+"""HATest playground — gateway 性能/高可用压测控制器（v1.5.0）。
 
 HA 语义：
 - 测试脚本以独立会话（setsid）脱离网关进程：网关重启压测不死
@@ -8,6 +8,8 @@ HA 语义：
   status() 解析尾部聚合出图表序列与汇总
 - 脚本韧性：API 连接级失败指数退避重试（总窗口 1800s，输出
   WAIT_GATEWAY 心跳）——网关重启窗口内压测等待而非失败
+- 原始日志：api() 每次调用输出「API> 调用命令 / API< 状态码+原始响应」
+  （HATEST_RAW=1 默认开；响应体 >2000 字符截断显示，raw=0 可关）
 """
 import json
 import os
@@ -35,6 +37,7 @@ BIG_COUNT="${HATEST_BIG_COUNT:-10}"
 SMALL_MB="${HATEST_SMALL_MB:-1}"
 SMALL_COUNT="${HATEST_SMALL_COUNT:-0}"
 FILL="${HATEST_FILL:-1}"
+RAW="${HATEST_RAW:-1}"
 BASE="${HATEST_BASE:-/home/tape_api/hatest}"
 MET="$BASE/metrics.jsonl"
 WORK="$BASE/work"
@@ -79,7 +82,18 @@ api() { # api METHOD PATH OUTFILE(空=收 body) [curl_extra...]
         sleep "$backoff"; waited=$((waited+backoff))
         backoff=$((backoff*2)); [ "$backoff" -gt 30 ] && backoff=30
         ;;
-      *) RC="$code"; API_MS=$(( $(ts_ms) - API_MS )); return 0 ;;
+      *) RC="$code"; API_MS=$(( $(ts_ms) - API_MS ))
+         if [ "$RAW" = "1" ]; then
+           log "API> $m $p | curl -sS -X $m '$API$p' $*"
+           if [ -n "$out" ]; then
+             log "API< $RC ${API_MS}ms -> $out ($(stat -c%s "$out" 2>/dev/null || echo '?') bytes)"
+           elif [ "${#BODY}" -gt 2000 ]; then
+             log "API< $RC ${API_MS}ms ${BODY:0:2000} ...(共${#BODY}字符,截断)"
+           else
+             log "API< $RC ${API_MS}ms $BODY"
+           fi
+         fi
+         return 0 ;;
     esac
   done
 }
@@ -338,7 +352,7 @@ main "$@"
 
 _PARAM_LIMITS = {"rounds": (0, 100000), "big_mb": (1, 16384),
                  "big_count": (1, 1000), "small_mb": (1, 1024),
-                 "small_count": (0, 1000), "fill": (0, 1)}
+                 "small_count": (0, 1000), "fill": (0, 1), "raw": (0, 1)}
 
 
 class HATestRunner:
@@ -383,7 +397,7 @@ class HATestRunner:
                               "a HATest run is already active (pid %d)" % self._pid())
         p = {"api": "http://127.0.0.1:8001/api/v1", "rounds": 0,
              "big_mb": 100, "big_count": 10, "small_mb": 1,
-             "small_count": 0, "fill": 1}
+             "small_count": 0, "fill": 1, "raw": 1}
         p.update(params or {})
         if not str(p["api"]).startswith(("http://", "https://")):
             raise HATestError("HATEST_BAD_PARAM", "api must be http(s) url")
@@ -408,7 +422,7 @@ class HATestRunner:
             os.replace(met, met + ".%d.old" % int(time.time()))
         exports = "".join("export HATEST_%s='%s'\n" % (k.upper(), p[k])
                            for k in ("api", "rounds", "big_mb", "big_count",
-                                     "small_mb", "small_count", "fill"))
+                                     "small_mb", "small_count", "fill", "raw"))
         exports += "export HATEST_BASE='%s'\n" % self.base
         if body.startswith("#!"):
             body = body.split("\n", 1)[1] if "\n" in body else ""

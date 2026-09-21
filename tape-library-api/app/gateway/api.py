@@ -1017,6 +1017,7 @@ class HATestParams(BaseModel):
     small_mb: int = 1
     small_count: int = 0
     fill: int = 1
+    raw: int = 1
 
 
 class HATestStartBody(BaseModel):

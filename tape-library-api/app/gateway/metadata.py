@@ -466,6 +466,33 @@ class MetadataDB:
                 return cur.fetchall()
 
     # ---------- tape media + blocks ----------
+    def file_purge(self, file_id):
+        """HATest 清理：删 file_meta/cache_entry 行，返回缓存路径供上层 unlink。
+
+        忙检查：gw_task 中该 file 仍有 queued/running 任务时返回 busy=True。
+        磁带台账（gw_block / LTFS 对象）不动：已写空间保持消耗，符合
+        HATest「写满」语义。"""
+        with self.conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT count(*) AS n FROM gw_task WHERE file_id=%s "
+                            "AND state IN ('queued','running')", (_uuid(file_id),))
+                row = cur.fetchone()
+                if row and int(row["n"]) > 0:
+                    return {"busy": True, "removed_rows": 0, "cache_paths": []}
+                cur.execute("SELECT cache_path FROM file_meta WHERE file_id=%s",
+                            (_uuid(file_id),))
+                paths = [r["cache_path"] for r in cur.fetchall()
+                         if r.get("cache_path")]
+                cur.execute("SELECT path FROM cache_entry "
+                            "WHERE object_id=%s AND kind='file'", (_uuid(file_id),))
+                paths += [r["path"] for r in cur.fetchall() if r.get("path")]
+                cur.execute("DELETE FROM file_meta WHERE file_id=%s",
+                            (_uuid(file_id),))
+                removed = cur.rowcount
+                cur.execute("DELETE FROM cache_entry WHERE object_id=%s "
+                            "AND kind='file'", (_uuid(file_id),))
+        return {"busy": False, "removed_rows": removed, "cache_paths": paths}
+
     def tape_upsert(self, barcode, state="appendable", format="raw"):
         with self.conn() as conn:
             with conn.cursor() as cur:

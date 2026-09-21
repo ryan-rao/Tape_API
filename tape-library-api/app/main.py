@@ -18,7 +18,7 @@ from app.models.common import fail
 def create_app(audit_dir=None, timeout=None, runner=None):
     app = FastAPI(
         title="Tape Library API",
-        version="1.3.0",
+        version="1.4.0",
         description="REST API for Linux Tape Library management: discovery, library/drive/media "
                     "operations, SCSI diagnostics, read/write tests, full audit trail. "
                     "Safety model: LEVEL_1 read-only, LEVEL_2 device ops, LEVEL_3 write/erase. "

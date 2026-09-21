@@ -15,6 +15,10 @@ from .config import (FILE_KEYS, GatewayConfig, config_file_path, load_config_fil
                      save_config_file)
 from .manager import GatewayError, GatewayManager
 from .tapeio import TapeError
+from .hatest import DEFAULT_SCRIPT, HATestError, HATestRunner
+
+# HATest 控制器单例：状态全文件化（/home/tape_api/hatest），网关重启后重附着
+_HATEST = HATestRunner()
 
 
 def _http(e: GatewayError):
@@ -983,6 +987,90 @@ def gw_ltfs_check(request: Request, barcode: str):
                   request_id=request.state.request_id)
     except TapeError as e:
         raise _tape_err(e)
+    except GatewayError as e:
+        raise _http(e)
+
+
+# ---------- HATest playground ----------
+class HATestParams(BaseModel):
+    api: str = "http://127.0.0.1:8001/api/v1"
+    rounds: int = 0
+    big_mb: int = 256
+    small_mb: int = 1
+    fill: int = 1
+
+
+class HATestStartBody(BaseModel):
+    script: str = None
+    params: HATestParams = None
+    confirm: bool = False
+
+
+@router.get("/hatest/script", summary="HATest 默认压测脚本模板（GUI 预填）")
+def gw_hatest_script(request: Request):
+    require_level("LEVEL_1")
+    return ok({"script": DEFAULT_SCRIPT, "version": "1.0"},
+              request_id=request.state.request_id)
+
+
+@router.post("/hatest/start",
+             summary="启动 HATest 压测（L3；setsid 脱离网关，网关重启压测不死）")
+def gw_hatest_start(request: Request, body: HATestStartBody):
+    require_level("LEVEL_3")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail={
+            "code": "HATEST_CONFIRM_REQUIRED",
+            "message": "confirm=true required (test writes data and occupies "
+                       "the drive, possibly for hours in fill mode)"})
+    try:
+        meta = _HATEST.start(body.script,
+                             body.params.dict() if body.params else None)
+        return ok(meta, code="HATEST_STARTED", request_id=request.state.request_id)
+    except HATestError as e:
+        raise HTTPException(status_code=409 if e.code == "HATEST_RUNNING" else 400,
+                            detail={"code": e.code, "message": e.message})
+
+
+@router.get("/hatest/status",
+             summary="HATest 运行态/汇总/图表序列（文件化重附着，网关重启无损）")
+def gw_hatest_status(request: Request):
+    require_level("LEVEL_1")
+    return ok(_HATEST.status(), request_id=request.state.request_id)
+
+
+@router.get("/hatest/log", summary="HATest 原始输出（offset 增量拉取）")
+def gw_hatest_log(request: Request, offset: int = Query(0, ge=0),
+                  limit: int = Query(65536, ge=1024, le=262144)):
+    require_level("LEVEL_1")
+    return ok(_HATEST.log(offset, limit), request_id=request.state.request_id)
+
+
+@router.post("/hatest/stop", summary="停止 HATest（kill 进程组）")
+def gw_hatest_stop(request: Request):
+    require_level("LEVEL_3")
+    return ok(_HATEST.stop(), code="HATEST_STOPPED",
+              request_id=request.state.request_id)
+
+
+@router.delete("/files/{file_id}",
+               summary="删除文件记录（元数据级：清缓存文件；磁带空间保留消耗——HATest 清理用）")
+def gw_file_delete(request: Request, file_id: str):
+    require_level("LEVEL_2")
+    gw = _gw(request)
+    try:
+        gw.resolve(file_id)  # FILE_NOT_FOUND → 404
+        res = gw.db.file_purge(file_id)
+        if res.get("busy"):
+            raise GatewayError("FILE_BUSY",
+                               "file %s has an in-flight task" % file_id,
+                               status=409)
+        for p in res.pop("cache_paths", []):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        res["file_id"] = file_id
+        return ok(res, code="FILE_DELETED", request_id=request.state.request_id)
     except GatewayError as e:
         raise _http(e)
 

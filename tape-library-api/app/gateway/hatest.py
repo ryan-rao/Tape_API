@@ -116,7 +116,7 @@ file_wait_archived() { # file_wait_archived <file_id> —— 轮询文件终态�
   FW_STATE=""; FW_S=0
   while :; do
     api GET "/archive/files/$fid" '' || return 1
-    FW_STATE=$(jget "$BODY" data.state)
+    FW_STATE=$(jget "$BODY" data.file.state)  # 实测：GET /files/{id} 走 resolve()，state 嵌套在 data.file 下
     case "$FW_STATE" in archived|failed) break ;; esac
     sleep 2; n=$((n+2)); [ "$n" -gt 7200 ] && { FW_STATE=timeout; break; }
   done
@@ -126,7 +126,7 @@ file_wait_archived() { # file_wait_archived <file_id> —— 轮询文件终态�
 arch_one() { # arch_one <file_id> —— 请求归档并等文件终态；已随容器连带归档则跳过
   local f="$1" pre c
   api GET "/archive/files/$f" '' || return 1
-  pre=$(jget "$BODY" data.state)
+  pre=$(jget "$BODY" data.file.state)
   if [ "$pre" = archived ]; then log "文件 ${f:0:8} 已随容器归档，跳过"; FW_S=0; return 0; fi
   api POST "/archive/files/$f/archive" '' || return 1
   c=$(jget "$BODY" data.container_id); [ -n "$c" ] && cid="$c"

@@ -1013,7 +1013,9 @@ class HATestParams(BaseModel):
     api: str = "http://127.0.0.1:8001/api/v1"
     rounds: int = 0
     big_mb: int = 256
+    big_count: int = 10
     small_mb: int = 1
+    small_count: int = 0
     fill: int = 1
 
 

@@ -130,9 +130,13 @@ arch_one() { # arch_one <file_id> —— 请求归档并等文件终态；已随
   api GET "/archive/files/$f" '' || return 1
   pre=$(jget "$BODY" data.file.state)
   if [ "$pre" = archived ]; then log "文件 ${f:0:8} 已随容器归档，跳过"; FW_S=0; return 0; fi
-  api POST "/archive/files/$f/archive" '' || return 1
-  c=$(jget "$BODY" data.container_id); [ -n "$c" ] && cid="$c"
-  log "归档请求: ${f:0:8} route=$(jget "$BODY" data.route) code=$(jget "$BODY" code)"
+  if [ "$pre" != cached ] && [ "$pre" != failed ]; then
+    log "文件 ${f:0:8} 状态=$pre（已在归档流程），等待终态"
+  else
+    api POST "/archive/files/$f/archive" '' || return 1
+    c=$(jget "$BODY" data.container_id); [ -n "$c" ] && cid="$c"
+    log "归档请求: ${f:0:8} route=$(jget "$BODY" data.route) code=$(jget "$BODY" code)"
+  fi
   file_wait_archived "$f" || return 1
   [ "$FW_STATE" = archived ] || { log "归档未完成: ${f:0:8} -> $FW_STATE"; return 1; }
   return 0

@@ -525,6 +525,23 @@ def gw_file_archive(request: Request, file_id: str):
         if f is None:
             return fail("FILE_NOT_FOUND", "no such file",
                         request_id=request.state.request_id)
+        # idempotent: any in-flight archive (direct tape task or container
+        # flush) answers ARCHIVE_ALREADY_QUEUED instead of INVALID_STATE --
+        # big-file uploads auto-queue archive_file on arrival, so a manual
+        # POST racing the worker must not look like an error.
+        t = gw.db.task_find_active("archive_file", file_id=file_id)
+        if t:
+            return ok({"file_id": file_id, "route": "tape", "state": t["state"],
+                       "task_id": t["task_id"]}, code="ARCHIVE_ALREADY_QUEUED",
+                      request_id=request.state.request_id)
+        if f["storage"] == "container" and f.get("container_id"):
+            cid = str(f["container_id"])
+            ct = gw.db.task_find_active("archive_container", container_id=cid)
+            if ct:
+                return ok({"file_id": file_id, "route": "container",
+                           "container_id": cid, "state": ct["state"],
+                           "task_id": ct["task_id"]}, code="ARCHIVE_ALREADY_QUEUED",
+                          request_id=request.state.request_id)
         if f["state"] not in ("cached", "failed"):
             return fail("INVALID_STATE",
                         "file state %s not archivable (cached/failed only)" % f["state"],

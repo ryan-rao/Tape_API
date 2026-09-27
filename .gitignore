@@ -26,3 +26,11 @@ tape-library-api/manual-evidence*/
 # runtime data & code backups (server-only, never sync)
 archive-cache/
 backup-*/
+
+# runtime logs / deploy backups / local state (server-only, never sync)
+uvicorn-*.log*
+tsconfig.tsbuildinfo
+dist.bak-*/
+*.bak-*
+hatest/
+gateway-config.json

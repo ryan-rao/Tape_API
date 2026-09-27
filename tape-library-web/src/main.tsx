@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { ConfigProvider } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import App from './App';
+import './mobile.css';
 import Dashboard from './pages/Dashboard';
 import Libraries from './pages/Libraries';
 import LibraryDetail from './pages/LibraryDetail';
@@ -11,9 +12,14 @@ import Drives from './pages/Drives';
 import DriveDetail from './pages/DriveDetail';
 import Tapes from './pages/Tapes';
 import TestCenter from './pages/TestCenter';
+import GatewayPlayground from './pages/GatewayPlayground';
 import Operations from './pages/Operations';
 import Audit from './pages/Audit'
 import ApiLogs from './pages/ApiLogs';
+import ApiPlayground from './pages/ApiPlayground';
+import CliPlayground from './pages/CliPlayground';
+import ArchiveGateway from './pages/ArchiveGateway';
+import CacheManagement from './pages/CacheManagement';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
@@ -28,9 +34,14 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
             <Route path="/drives/:nst" element={<DriveDetail />} />
             <Route path="/tapes" element={<Tapes />} />
             <Route path="/tests" element={<TestCenter />} />
+            <Route path="/tests/gateway" element={<GatewayPlayground />} />
             <Route path="/operations" element={<Operations />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/api-logs" element={<ApiLogs />} />
+            <Route path="/tests/api" element={<ApiPlayground />} />
+            <Route path="/tests/cli" element={<CliPlayground />} />
+            <Route path="/archive" element={<ArchiveGateway />} />
+            <Route path="/cache" element={<CacheManagement />} />
           </Route>
         </Routes>
       </BrowserRouter>

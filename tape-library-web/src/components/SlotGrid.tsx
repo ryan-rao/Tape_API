@@ -9,9 +9,9 @@ export function SlotGrid({ slots, perRow = 6, onPick }: {
   const rows: SlotInfo[][] = [];
   for (let i = 0; i < slots.length; i += perRow) rows.push(slots.slice(i, i + perRow));
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
       {rows.map((row, ri) => (
-        <div key={ri} style={{ display: 'flex', gap: 8 }}>
+        <div key={ri} style={{ display: 'flex', gap: 8, width: 'max-content' }}>
           {row.map((s) => (
             <SlotCell key={s.slot} slot={s} onPick={onPick} />
           ))}
@@ -58,7 +58,7 @@ export function SlotDetailModal({ slot, open, onClose, onAction }: {
 }) {
   if (!slot) return null;
   return (
-    <Modal open={open} title="Slot Information" footer={null} onCancel={onClose} width={420}>
+    <Modal open={open} title="Slot Information" footer={null} onCancel={onClose} width={420} style={{ maxWidth: '94vw' }}>
       <div style={{ fontFamily: 'monospace', lineHeight: 2 }}>
         <div>Element: <b>{slot.element}</b> (0x{slot.element.toString(16)})</div>
         <div>Barcode: <b>{slot.barcode || '-'}</b></div>

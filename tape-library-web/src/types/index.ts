@@ -57,6 +57,14 @@ export interface DriveInfo {
   temperature: number | null;
   tapealert: { triggered_count: number; all_clear: boolean };
   health: HealthStatus;
+  // —— /drives/list 聚合新字段（可选，旧 mock/兼容路径不返回）——
+  media_serial?: string | null;   // 在机磁带 MAM 序列号
+  source_slot?: number | null;    // 装载来源槽位
+  library?: { changer: string; dte: number; library_sn?: string; source_slot?: number | null } | null;
+  humidity?: number | null;       // 湿度（本机型不可测：null）
+  power_on_hours?: number | null;
+  media_loads?: number | null;
+  errors?: string[];
 }
 
 export interface TapeInfo {
@@ -73,6 +81,12 @@ export interface TapeInfo {
   write_bytes?: number;
   mount_count?: number;
   error_count?: number;
+  // —— /tapes/list 聚合新字段（可选）——
+  sn?: string | null;             // 介质序列号（MAM，装载态才可读）
+  media_state?: string;           // 台账状态 appendable/full/faulted/unregistered
+  changer?: string;               // 所在带库
+  capacity_bytes?: number | null;
+  used_bytes?: number | null;
 }
 
 export type TestKind = 'read' | 'write' | 'write-verify' | 'full';

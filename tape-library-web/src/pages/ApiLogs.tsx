@@ -51,7 +51,7 @@ export default function ApiLogs() {
     <Card
       title={<><ApiOutlined /> API Call Logs（输入 / 输出）</>}
       extra={
-        <Space>
+        <Space wrap>
           <span>10s 刷新</span>
           <Switch size="small" checked={auto} onChange={setAuto} />
           <span>仅看失败</span>

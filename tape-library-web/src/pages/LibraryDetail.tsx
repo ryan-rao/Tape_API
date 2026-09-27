@@ -40,10 +40,19 @@ export default function LibraryDetail() {
   const doLoad = async () => {
     if (!changer || !confirmLoad) return;
     setBusy(true);
-    const r = await api.load(changer, confirmLoad.slot, targetDrive);
+    // v1.2 参数：磁带用 barcode（后端动作前检查必在槽位），带机用 drive_sn（序列号，检查存在/可达/为空）；无 SN 时退回 nst 设备名
+    const dvol = drives[targetDrive];
+    const r = await api.load(changer, {
+      barcode: confirmLoad.barcode || undefined,
+      drive_sn: dvol?.serial || undefined,
+      drive_position: dvol?.serial ? undefined : (dvol?.nst ? `nst${dvol.nst.replace(/^nst/, '')}` : undefined),
+      tape_position: confirmLoad.barcode ? undefined : `S${confirmLoad.slot}`,
+    });
     setBusy(false); setConfirmLoad(null);
-    if (r.success) message.success(r.message);
-    else message.error(`${r.code}: ${r.message}`);
+    if (r.success) {
+      const res = (r.data as any)?.resolved;
+      message.success(res ? `已装载：${res.tape} → ${res.drive}（${res.drive_method}${(r.data as any)?.checks?.drive?.serial ? ` · SN ${(r.data as any).checks.drive.serial}` : ''}）` : r.message);
+    } else message.error(`${r.code}: ${r.message}`);
     load();
   };
 
@@ -110,8 +119,8 @@ export default function LibraryDetail() {
         items={[
           ['Library', `/dev/${changer}`],
           ['Tape', confirmLoad?.barcode || ''],
-          ['Source', `Slot ${confirmLoad?.slot}`],
-          ['Destination', `Drive ${targetDrive} (${drives[targetDrive]?.nst || '?'})`],
+          ['磁带位置', `槽位 S${String(confirmLoad?.slot).padStart(3, '0')}（barcode 自动定位）`],
+          ['带机位置', `Drive ${targetDrive} · /dev/${drives[targetDrive]?.nst || '?'} · ${drives[targetDrive]?.library?.dte != null ? 'DTE' + drives[targetDrive].library.dte : '按 nst 解析'}`],
           ['Risk', '🟡 LEVEL_2 · 此操作将物理移动磁带'],
         ]}
         onCancel={() => setConfirmLoad(null)} onConfirm={doLoad}

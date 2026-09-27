@@ -2,7 +2,7 @@
 export interface ApiLogEntry {
   id: number;
   ts: string;              // ISO 时间
-  method: 'GET' | 'POST';
+  method: 'GET' | 'POST' | 'DELETE';
   path: string;            // /api/v1/...
   request_body?: any;      // POST 入参
   status: number;          // HTTP 状态码（0 = 网络失败/本地 mock）

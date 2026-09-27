@@ -21,6 +21,7 @@ function normalizeError(e: any): ApiResponse {
     // FastAPI 错误体 {detail:{code,message}} —— detail 可能是对象，需展开
     const det = typeof d.detail === 'object' && d.detail !== null ? d.detail : {};
     return {
+      ...d, // 保留响应体自带的附加字段（如 job 信封的 command_ids/job_id/audit_url）
       success: false,
       code: d.code || det.code || `HTTP_${e.response.status}`,
       message: d.message || det.message || (typeof d.detail === 'string' ? d.detail : '') || e.response.statusText,
@@ -77,6 +78,8 @@ function pathKey(path: string): string {
     '/drives': 'listDrives', '/operations': 'operations', '/audit': 'auditList',
   };
   let key = m[path];
+  if (!key && path.startsWith('/drives/') && path.endsWith('/list')) key = 'driveList';
+  if (!key && path.startsWith('/tapes/') && path.endsWith('/list')) key = 'tapeList';
   if (!key && path.startsWith('/libraries/') && path.endsWith('/status')) key = 'libraryStatus:' + path.split('/')[2];
   if (!key && path.startsWith('/libraries/') && path.endsWith('/inventory')) key = 'libraryInventory:' + path.split('/')[2];
   if (!key && path.startsWith('/test-sessions')) key = 'session:' + path.split('/')[2];
@@ -175,27 +178,73 @@ async function realInventory(changer: string): Promise<ApiResponse> {
 }
 
 async function realDrives(): Promise<ApiResponse> {
-  const r = await get('/discovery');
+  // 新版：后端 /drives/list 聚合接口（sg_inq 序列号 + DTE 位置 + MAM 介质 SN + 温湿度 + 寿命统计）
+  const r = await get('/drives/list');
   if (!r.success) return r;
-  const devs = ((r.data?.devices || (Array.isArray(r.data) ? r.data : [])) as any[])
-    .filter((x) => x.device_type === 'TAPE');
-  // 合并带库 DTE 装载信息（磁带在带机里 → loaded_tape/status）
-  const dtes = await libraryDtes();
+  const list = (r.data?.drives || r.data || []) as any[];
   return {
     ...r,
-    data: devs.map((x, i) => {
-      const dte = dtes[i];
+    data: list.map((x, i) => {
+      const env = x.environment || {};
+      const alert = env.alert || {};
+      const trig = [alert.drive_temperature, alert.drive_humidity].filter((v: number) => v).length;
       return {
-        index: i, sg: strip(x.sg_device), nst: strip(x.nst_device || x.st_device || ''),
-        vendor: x.vendor, model: x.product, serial: '', firmware: '',
-        scsi_address: x.scsi_address,
-        status: dte?.occupied ? 'LOADED' : 'EMPTY',
-        loaded_tape: dte?.barcode ?? null,
-        source_slot: dte?.source_slot ?? null,
-        block_size: 0, compression: true, temperature: null,
-        tapealert: { triggered_count: 0, all_clear: true }, health: 'Healthy',
+        index: x.index ?? i, sg: strip(x.sg || ''), nst: strip(x.nst || x.st || ''),
+        vendor: x.vendor, model: x.product || x.model,
+        serial: x.serial || '', firmware: x.firmware || '',
+        scsi_address: x.scsi_address || '',
+        status: x.state || x.status || 'UNKNOWN',
+        loaded_tape: x.loaded_tape ?? null,
+        media_serial: x.media_serial ?? null,
+        source_slot: x.library?.source_slot ?? x.source_slot ?? null,
+        library: x.library || null,
+        temperature: env.temperature_c ?? x.temperature ?? null,
+        temperature_source: env.temperature_source ?? null,
+        humidity: env.humidity_pct ?? null,
+        power_on_hours: env.stats?.power_on_hours ?? null,
+        media_loads: env.stats?.media_loads ?? null,
+        errors: x.errors || [],
+        block_size: x.block_size ?? 0, compression: true,
+        tapealert: { triggered_count: trig, all_clear: trig === 0 },
+        health: (x.state === 'ERROR' || x.state === 'OFFLINE') ? 'Critical'
+          : trig > 0 ? 'Warning' : 'Healthy',
       };
     }),
+  };
+}
+
+async function realTapeList(): Promise<ApiResponse> {
+  // 新版：后端 /tapes/list 聚合接口（barcode + MAM SN + 物理位置 + 网关台账）
+  const r = await get('/tapes/list');
+  if (!r.success) return r;
+  const items = (r.data?.tapes || r.data?.items || (Array.isArray(r.data) ? r.data : [])) as any[];
+  return {
+    ...r,
+    data: {
+      // 保持与后端同形信封：{tapes, slots, ledger}，页面直接消费
+      tapes: items.map((t) => {
+      const loc = t.location || {};
+      const inDrive = loc.type === 'drive';
+      return {
+        barcode: t.barcode, sn: t.sn ?? t.serial ?? null,
+        media_type: t.media_type || 'LTO', generation: t.generation ?? '',
+        slot: inDrive ? null : (loc.slot ?? t.slot ?? null),
+        drive: inDrive ? strip(loc.nst || `nst${(loc.dte ?? 0) + 1}`) : null,
+        changer: loc.changer ?? t.changer ?? null,
+        dte: inDrive ? loc.dte : null,
+        source_slot: loc.source_slot ?? null,
+        status: inDrive ? 'Loaded' : 'Available',
+        media_state: t.media_state ?? t.state ?? 'unregistered',
+        registered: t.registered,
+        write_protect: !!t.write_protect, health: t.health || 'Good',
+        mount_count: t.mount_count ?? undefined,
+        capacity_bytes: t.capacity_bytes ?? null, used_bytes: t.used_bytes ?? null,
+        file_number: t.file_number ?? null,
+      };
+    }),
+      slots: r.data?.slots,
+      ledger: r.data?.ledger,
+    },
   };
 }
 
@@ -235,7 +284,7 @@ async function realDriveDetail(nst: string): Promise<ApiResponse> {
 
 // mock 直调的日志包装：保证 mock 模式与 real 模式日志一致
 async function mockLogged(
-  method: 'GET' | 'POST', path: string, body: any, fn: () => any,
+  method: 'GET' | 'POST' | 'DELETE', path: string, body: any, fn: () => any,
 ): Promise<ApiResponse> {
   const t0 = performance.now();
   const r: ApiResponse = await fn();
@@ -263,17 +312,28 @@ export const api = {
 
   // Drives
   listDrives: async (): Promise<ApiResponse> =>
-    API_MODE === 'mock' ? mockLogged('GET', '/drives', undefined, () => mockApi.listDrives()) : realDrives(),
+    API_MODE === 'mock' ? mockLogged('GET', '/drives/list', undefined, () => mockApi.driveList()) : realDrives(),
+  listTapes: async (): Promise<ApiResponse> =>
+    API_MODE === 'mock' ? mockLogged('GET', '/tapes/list', undefined, () => mockApi.tapeList()) : realTapeList(),
+  // v1.2 槽位聚合清单：位置/占用/条码 + 网关介质台账（过滤 occupied_only/barcode，分页 limit/offset）
+  listSlots: (changer: string, q?: { refresh?: boolean; occupied_only?: boolean; barcode?: string; limit?: number; offset?: number }) => {
+    const qs = q ? Object.entries(q).filter(([, v]) => v !== undefined && v !== false && v !== 0 && v !== '')
+      .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&') : '';
+    const path = `/libraries/${changer}/slots/list${qs ? '?' + qs : ''}`;
+    return API_MODE === 'mock' ? mockLogged('GET', path, undefined, () => mockApi.slotsList(changer, q || {})) : get(path);
+  },
   driveDetail: (nst: string) =>
     API_MODE === 'mock' ? mockLogged('GET', `/drives/${nst}/status`, undefined, () => mockApi.driveDetail(nst)) : realDriveDetail(nst),
 
-  // Robot operations (LEVEL 2)
-  load: (changer: string, slot: number, drive: number) =>
-    API_MODE === 'mock' ? mockLogged('POST', `/libraries/${changer}/load`, { slot, drive, confirm: true }, () => mockApi.load(changer, slot, drive))
-      : post(`/libraries/${changer}/load`, { slot, drive, confirm: true }),
-  unload: (changer: string, slot: number, drive: number) =>
-    API_MODE === 'mock' ? mockLogged('POST', `/libraries/${changer}/unload`, { slot, drive, confirm: true }, () => mockApi.unload(changer, slot, drive))
-      : post(`/libraries/${changer}/unload`, { slot, drive, confirm: true }),
+  // Robot operations (LEVEL 2)——v1.2 推荐参数：load 用 barcode(磁带条码)+drive_sn(带机序列号，GET /drives/list 可查)；
+  // unload 用 barcode+slot(目标槽，缺省自动回原槽)。动作前服务端双状态检查，响应 checks.* 回显。
+  // 兼容旧字段 tape_position/drive_position/slot/drive。
+  load: (changer: string, p: { barcode?: string; drive_sn?: string; slot?: number; drive?: number; tape_position?: string; drive_position?: string }) =>
+    API_MODE === 'mock' ? mockLogged('POST', `/libraries/${changer}/load`, { ...p, confirm: true }, () => mockApi.load(changer, p))
+      : post(`/libraries/${changer}/load`, { ...p, confirm: true }),
+  unload: (changer: string, p: { barcode?: string; drive_sn?: string; slot?: number; drive?: number; tape_position?: string; drive_position?: string }) =>
+    API_MODE === 'mock' ? mockLogged('POST', `/libraries/${changer}/unload`, { ...p, confirm: true }, () => mockApi.unload(changer, p))
+      : post(`/libraries/${changer}/unload`, { ...p, confirm: true }),
   rewind: (nst: string) =>
     API_MODE === 'mock' ? mockLogged('POST', `/drives/${nst}/rewind`, { confirm: true }, () => mockApi.rewind(nst)) : post(`/drives/${nst}/rewind`, { confirm: true }),
 
@@ -299,6 +359,74 @@ export const api = {
 };
 
 function norm(r: ApiResponse): ApiResponse { return r; }
+
+// 裸请求：绕过 mock/适配层，直接打真实后端（Archive 网关 / Playground 用）
+// 202 + job_id 异步语义下 http_status 携带原始状态码，调用方自行轮询 /jobs/{id}
+// binary=true：下载端点的二进制流（Blob）；JSON 信封（202/错误）自动解析回统一格式
+export async function rawRequest(
+  method: 'GET' | 'POST' | 'DELETE',
+  path: string,
+  opts: { body?: any; query?: Record<string, string | number | undefined | null>; binary?: boolean } = {},
+): Promise<ApiResponse & { http_status?: number; blob?: Blob; filename?: string }> {
+  const t0 = performance.now();
+  const isForm = typeof FormData !== 'undefined' && opts.body instanceof FormData;
+  let url = path;
+  if (opts.query) {
+    const qs = Object.entries(opts.query)
+      .filter(([, v]) => v !== undefined && v !== null && v !== '')
+      .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+      .join('&');
+    if (qs) url += (path.includes('?') ? '&' : '?') + qs;
+  }
+  const cfg: any = { method, url, timeout: 7200000 };
+  if (opts.body !== undefined) cfg.data = opts.body;
+  if (isForm) {
+    // FormData 必须让浏览器自动生成 multipart boundary（axios 默认 JSON 头会破坏它）
+    cfg.headers = { 'Content-Type': undefined };
+  }
+  if (opts.binary) cfg.responseType = 'blob';
+  try {
+    const r = await http.request(cfg);
+    if (opts.binary && r.data instanceof Blob) {
+      const ct = String(r.headers?.['content-type'] || r.data.type || '');
+      // 202 异步信封 / 错误信封也会以 Blob 到达：解析回 JSON 走统一逻辑
+      if (ct.includes('application/json')) {
+        try {
+          const parsed = JSON.parse(await r.data.text());
+          logApiCall({ method, path: `/api/v1${path}`, status: r.status, ok: !!parsed?.success, code: parsed?.code || '', request_id: parsed?.request_id, duration_ms: Math.round(performance.now() - t0), response: parsed });
+          return { ...parsed, http_status: r.status };
+        } catch { /* 保底走二进制展示 */ }
+      }
+      // 真二进制：提取 filename，返回 Blob 供调用方落盘
+      const cd = String(r.headers?.['content-disposition'] || '');
+      const m = cd.match(/filename\*=(?:UTF-8'')?([^;]+)|filename="?([^";]+)"?/i);
+      let filename = 'download.bin';
+      if (m && (m[1] || m[2])) {
+        try { filename = decodeURIComponent(String(m[1] || m[2]).replace(/"/g, '')); } catch { filename = String(m[1] || m[2]); }
+      }
+      logApiCall({ method, path: `/api/v1${path}`, status: r.status, ok: true, code: 'BINARY', duration_ms: Math.round(performance.now() - t0), response: { filename, size: r.data.size, content_type: ct } });
+      return {
+        success: true, code: 'BINARY', message: 'binary downloaded', http_status: r.status,
+        blob: r.data, filename,
+        data: { filename, size_bytes: r.data.size, content_type: ct },
+      };
+    }
+    logApiCall({ method, path: `/api/v1${path}`, status: r.status, ok: !!r.data?.success, code: r.data?.code || '', request_id: r.data?.request_id, duration_ms: Math.round(performance.now() - t0), response: r.data });
+    return { ...r.data, http_status: r.status };
+  } catch (e: any) {
+    const n = normalizeError(e) as ApiResponse & { http_status?: number; blob?: Blob; filename?: string };
+    n.http_status = e?.response?.status;
+    // binary 模式下错误体也是 Blob：JSON 解析回信封
+    if (e?.response?.data instanceof Blob) {
+      try {
+        const parsed = JSON.parse(await e.response.data.text());
+        Object.assign(n, parsed, { success: false });
+      } catch { /* 保留网络错误归一化 */ }
+    }
+    logApiCall({ method, path: `/api/v1${path}`, status: e?.response?.status || 0, ok: false, code: n.code, duration_ms: Math.round(performance.now() - t0), response: n });
+    return n;
+  }
+}
 
 // 错误码 → 用户友好文案
 export function friendlyError(resp: ApiResponse): { title: string; detail: string } {
